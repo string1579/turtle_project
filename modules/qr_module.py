@@ -29,8 +29,15 @@ class QRModule:
         if DEBUG:
             print(f"[DEBUG-QR] Parsing text for Goal: '{text}'")
 
-        # Format: goal_name:x,y,yaw
-        m = re.match(r"([a-zA-Z0-9_]+)\s*[:]\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)", text)
+        # [수정] 사용자가 'nav_goal:' 접두어를 붙였을 경우 제거
+        if text.lower().startswith("nav_goal:"):
+            text = text[9:].strip() # 'nav_goal:' 길이만큼 자름
+
+        # [수정] 정규식 개선: 구분자가 콜론(:) 또는 쉼표(,) 또는 공백일 수 있음
+        # 기존: r"([a-zA-Z0-9_]+)\s*[:]\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)"
+        # 변경: (이름) [:,] (X) , (Y) , (Yaw)
+        m = re.match(r"([a-zA-Z0-9_]+)\s*[:,\s]\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)", text)
+
         if m:
             if DEBUG:
                 print(f"[DEBUG-QR] Regex Match Success: Name={m.group(1)}, X={m.group(2)}, Y={m.group(3)}, Yaw={m.group(4)}")
@@ -53,7 +60,6 @@ class QRModule:
         elif data == "mark":
             event_str = "MARK"
         elif data == "home":
-            # Example home coordinate
             event_str = "NAV_GOAL:home,0.0,0.0,0.0"
         else:
             parsed = self._parse_qr_goal(data)
@@ -77,24 +83,30 @@ class QRModule:
                 last_data = self.last_qr_data.get(robot_id, "")
                 last_time = self.last_qr_time.get(robot_id, 0)
 
+                # [수정] 디바운스 체크: 이전에 '성공적으로 처리된' 데이터와 같을 때만 무시
                 if processed_data == last_data and (current_time - last_time) < self.DEBOUNCE_TIME:
                     if DEBUG:
                         print(f"[DEBUG-QR] Ignored (Debounce): '{processed_data}' (Time diff: {current_time - last_time:.2f}s)")
                     return None
 
                 if DEBUG:
-                    print(f"[DEBUG-QR] New Valid QR Accepted: '{processed_data}'")
+                    print(f"[DEBUG-QR] New QR Detected: '{processed_data}'")
 
-                self.last_qr_data[robot_id] = processed_data
-                self.last_qr_time[robot_id] = current_time
+                # [중요 수정] 여기서 바로 last_qr_data를 업데이트 하지 않음!
+                # 이벤트 생성(파싱)에 성공해야만 업데이트 함.
+                # 그래야 파싱 실패 시 다음 프레임에서 다시 시도할 수 있음.
 
                 event_str = self._create_event_string(processed_data)
 
                 if event_str:
+                    # [성공 시에만 기록 업데이트]
+                    self.last_qr_data[robot_id] = processed_data
+                    self.last_qr_time[robot_id] = current_time
+
                     print(f"[QR] Robot {robot_id} Detected: '{processed_data}' -> Event: '{event_str}'")
                     return event_str
                 elif DEBUG:
-                    print(f"[DEBUG-QR] Event creation failed for: '{processed_data}'")
+                    print(f"[DEBUG-QR] Event creation failed for: '{processed_data}' - Will retry next frame")
 
         except Exception as e:
             print(f"[QR] Processing Error (Robot {robot_id}): {e}")
