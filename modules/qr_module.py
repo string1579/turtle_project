@@ -4,7 +4,7 @@ import time
 import numpy as np
 
 # ==========================================
-# [설정] 디버그 모드 (True: 상세 로그 출력, False: 숨김)
+# [설정] 디버그 모드
 DEBUG = True
 # ==========================================
 
@@ -29,13 +29,9 @@ class QRModule:
         if DEBUG:
             print(f"[DEBUG-QR] Parsing text for Goal: '{text}'")
 
-        # [수정] 사용자가 'nav_goal:' 접두어를 붙였을 경우 제거
         if text.lower().startswith("nav_goal:"):
-            text = text[9:].strip() # 'nav_goal:' 길이만큼 자름
+            text = text[9:].strip()
 
-        # [수정] 정규식 개선: 구분자가 콜론(:) 또는 쉼표(,) 또는 공백일 수 있음
-        # 기존: r"([a-zA-Z0-9_]+)\s*[:]\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)"
-        # 변경: (이름) [:,] (X) , (Y) , (Yaw)
         m = re.match(r"([a-zA-Z0-9_]+)\s*[:,\s]\s*([-0-9.]+)\s*,\s*([-0-9.]+)\s*,\s*([-0-9.]+)", text)
 
         if m:
@@ -79,11 +75,20 @@ class QRModule:
 
             if data:
                 processed_data = data.strip().lower()
-
                 last_data = self.last_qr_data.get(robot_id, "")
                 last_time = self.last_qr_time.get(robot_id, 0)
 
-                # [수정] 디바운스 체크: 이전에 '성공적으로 처리된' 데이터와 같을 때만 무시
+                # [수정] 'mark' 명령어에 대한 특수 처리
+                # MARK는 한 번 인식되면, 다른 QR(stop, nav_goal 등)을 보기 전까지는
+                # 시간이 아무리 지나도 다시 실행하지 않음 (무한 디바운스)
+                if processed_data == "mark" and last_data == "mark":
+                    if DEBUG and (current_time - last_time) > self.DEBOUNCE_TIME:
+                        # 로그가 너무 많이 찍히지 않도록 3초 지났을 때만 한 번씩 출력
+                        print(f"[DEBUG-QR] Ignored 'mark' (Already processed, waiting for different QR)")
+                        self.last_qr_time[robot_id] = current_time # 시간만 갱신해서 로그 폭주 방지
+                    return None
+
+                # [기존] 일반 명령어(nav_goal, stop 등)에 대한 시간 기반 디바운스
                 if processed_data == last_data and (current_time - last_time) < self.DEBOUNCE_TIME:
                     if DEBUG:
                         print(f"[DEBUG-QR] Ignored (Debounce): '{processed_data}' (Time diff: {current_time - last_time:.2f}s)")
@@ -92,21 +97,17 @@ class QRModule:
                 if DEBUG:
                     print(f"[DEBUG-QR] New QR Detected: '{processed_data}'")
 
-                # [중요 수정] 여기서 바로 last_qr_data를 업데이트 하지 않음!
-                # 이벤트 생성(파싱)에 성공해야만 업데이트 함.
-                # 그래야 파싱 실패 시 다음 프레임에서 다시 시도할 수 있음.
-
                 event_str = self._create_event_string(processed_data)
 
                 if event_str:
-                    # [성공 시에만 기록 업데이트]
+                    # 성공 시 데이터 업데이트
                     self.last_qr_data[robot_id] = processed_data
                     self.last_qr_time[robot_id] = current_time
 
                     print(f"[QR] Robot {robot_id} Detected: '{processed_data}' -> Event: '{event_str}'")
                     return event_str
                 elif DEBUG:
-                    print(f"[DEBUG-QR] Event creation failed for: '{processed_data}' - Will retry next frame")
+                    print(f"[DEBUG-QR] Event creation failed for: '{processed_data}'")
 
         except Exception as e:
             print(f"[QR] Processing Error (Robot {robot_id}): {e}")

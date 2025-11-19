@@ -17,8 +17,10 @@ from cv_bridge import CvBridge
 from multiprocessing import Process, Queue
 
 # ==========================================
-# [설정] 디버그 모드 (True: 상세 로그 출력, False: 숨김)
+# [설정] 디버그 모드
 DEBUG = True
+# [설정] QR 정렬 타임아웃 (초) - 이 변수가 없어서 멈췄던 것입니다.
+QR_LOST_TIMEOUT = 5.0
 # ==========================================
 
 class TurtlebotBridge(Node):
@@ -63,16 +65,24 @@ class TurtlebotBridge(Node):
         self.last_qr_width = 0.0
         self.latest_frame_width = 320
 
+        # [수정] 누락되었던 변수 초기화 추가
+        self.last_qr_seen_time = 0.0
+        self.process_frame_count = 0
+
         # PID Gains for Alignment
-        self.TARGET_QR_WIDTH = 120.0 # Target size in pixels (Adjust distance)
+        self.TARGET_QR_WIDTH = 120.0
         self.K_CX = 0.002
         self.K_ANG = 0.01
         self.K_DIST = 0.0015
 
         # Thresholds
-        self.THRESH_CX = 15
-        self.THRESH_ANG = 5.0
-        self.THRESH_DIST = 15.0
+        self.THRESH_CX = 5.0
+        self.THRESH_ANG = 2.0
+        self.THRESH_DIST = 5.0
+
+        # Min Velocities
+        self.MIN_LIN_VEL = 0.02
+        self.MIN_ANG_VEL = 0.1
 
         # Command Throttling
         self._last_cmd_time = 0.0
@@ -85,17 +95,13 @@ class TurtlebotBridge(Node):
         self.get_logger().info(f"Bridge Started: Robot {robot_id} (Domain {domain_id})")
 
     def start_navigation_server(self):
-        """Launch Nav2 Stack for this robot namespace/domain"""
         map_path = os.path.expanduser("~/maps/map.yaml")
         if not os.path.exists(map_path):
             self.get_logger().warn(f"Map not found at {map_path}, Nav2 might fail.")
 
-        # Environment for this subprocess
         env = os.environ.copy()
         env['ROS_DOMAIN_ID'] = str(self.domain_id)
 
-        # Command: Launch Nav2 (Headless)
-        # Assuming turtlebot3_navigation2 package is installed
         cmd = [
             'ros2', 'launch', 'turtlebot3_navigation2', 'navigation2.launch.py',
             'use_sim_time:=False',
@@ -104,18 +110,17 @@ class TurtlebotBridge(Node):
         ]
 
         try:
-            # [수정] DEBUG 모드일 때 Nav2 로그도 터미널에 표시, 아니면 숨김
             if DEBUG:
                 stdout_opt = None
                 stderr_opt = None
             else:
-                stdout=None,  # 기존: subprocess.DEVNULL
-                stderr=None,  # 기존: subprocess.PIPE
+                stdout_opt = subprocess.DEVNULL
+                stderr_opt = subprocess.PIPE
 
             self.nav_process = subprocess.Popen(
                 cmd, env=env,
-                stdout=None,  # 기존: subprocess.DEVNULL
-                stderr=None,  # 기존: subprocess.PIPE
+                stdout=stdout_opt,
+                stderr=stderr_opt,
                 preexec_fn=os.setsid
             )
             self.get_logger().info(f"Nav2 Process Launched (PID: {self.nav_process.pid})")
@@ -130,16 +135,37 @@ class TurtlebotBridge(Node):
 
         # 2. Handle Visual Servoing (MARK)
         if self.mark_state == "ALIGNING":
-            self.process_alignment()
+            try:
+                self.process_alignment()
+            except Exception as e:
+                self.get_logger().error(f"[Control Loop Error] {e}")
+                self.mark_state = "IDLE" # 에러 발생 시 안전하게 정지
 
     def process_alignment(self):
-        if self.nav_busy: return # Priority to Nav
+        if self.nav_busy: return
 
+        # 1. QR이 안 보일 때 (타임아웃 처리 포함)
         if not self.qr_visible or self.last_qr_center is None:
-            # Lost QR -> Rotate slowly to find it
+            # [안전장치] last_qr_seen_time이 없으면 현재 시간으로 초기화
+            if not hasattr(self, 'last_qr_seen_time'):
+                self.last_qr_seen_time = time.time()
+
+            time_since_lost = time.time() - self.last_qr_seen_time
+
+            if time_since_lost > QR_LOST_TIMEOUT:
+                self.get_logger().warn(f"[MARK] Failed: QR Lost for {time_since_lost:.1f}s. Aborting.")
+                self.stop()
+                self.mark_state = "IDLE"
+                self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Mark Alignment Timeout'})
+                return
+
+            if DEBUG and (self.get_clock().now().nanoseconds % 500000000 < 100000000): # 0.5초마다 로그
+                self.get_logger().info(f"[MARK] Searching QR... (Lost for {time_since_lost:.1f}s)")
+
             self.move(0.0, 0.2)
             return
 
+        # 2. 오차 계산
         cx, cy = self.last_qr_center
         angle = self.last_qr_angle
         width = self.last_qr_width
@@ -149,10 +175,10 @@ class TurtlebotBridge(Node):
         err_ang = angle
         err_dist = self.TARGET_QR_WIDTH - width
 
-        if DEBUG and (self.get_clock().now().nanoseconds % 1000000000 < 100000000): # 1초에 한 번 정도만 로그
-             self.get_logger().info(f"[MARK] Errors - Cx:{err_cx:.1f}, Ang:{err_ang:.1f}, Dist:{err_dist:.1f}")
+        if DEBUG and (self.get_clock().now().nanoseconds % 500000000 < 100000000):
+             self.get_logger().info(f"[MARKING] ErrCx:{err_cx:.1f}, ErrAng:{err_ang:.1f}, ErrDist:{err_dist:.1f}")
 
-        # Check Success
+        # 3. 정밀 정렬 완료 체크
         if abs(err_cx) < self.THRESH_CX and \
            abs(err_ang) < self.THRESH_ANG and \
            abs(err_dist) < self.THRESH_DIST:
@@ -160,23 +186,24 @@ class TurtlebotBridge(Node):
             self.stop()
             self.mark_state = "DONE"
             self.put_status({'type': 'mark_complete'})
-            self.get_logger().info("Mark Alignment Complete")
-
-            # Reset to IDLE after a moment
+            self.get_logger().info(f"[MARK SUCCESS] Final Error -> Cx:{err_cx:.2f}, Ang:{err_ang:.2f}, Dist:{err_dist:.2f}")
             self.mark_state = "IDLE"
             return
 
-        # PID Control
-        # X Error -> Turn
-        # Angle Error -> Turn
-        # Width Error (Distance) -> Move Forward/Back
-
+        # 4. PID 제어
         ang_spd = -(self.K_CX * err_cx) - (self.K_ANG * err_ang)
         lin_spd = self.K_DIST * err_dist
 
-        # Clamp
+        # 최소 속도 보정
+        if abs(lin_spd) < self.MIN_LIN_VEL and abs(err_dist) > self.THRESH_DIST:
+            lin_spd = self.MIN_LIN_VEL * np.sign(lin_spd)
+
+        if abs(ang_spd) < self.MIN_ANG_VEL and (abs(err_cx) > self.THRESH_CX or abs(err_ang) > self.THRESH_ANG):
+            ang_spd = self.MIN_ANG_VEL * np.sign(ang_spd)
+
+        # 최대 속도 제한
         lin_spd = np.clip(lin_spd, -0.1, 0.1)
-        ang_spd = np.clip(ang_spd, -0.5, 0.5)
+        ang_spd = np.clip(ang_spd, -0.4, 0.4)
 
         self.move(lin_spd, ang_spd)
 
@@ -203,6 +230,18 @@ class TurtlebotBridge(Node):
 
         elif c_type == 'start_mark_alignment':
             self.get_logger().info("Starting MARK Alignment")
+
+            # [수정] 변수 초기화 (누락되었던 부분)
+            self.qr_visible = False
+            self.last_qr_center = None
+            self.last_qr_angle = 0.0
+            self.last_qr_width = 0.0
+            self.last_qr_seen_time = time.time() # 타임아웃 카운트 시작
+
+            # 즉시 반응하도록 이전 속도 기록 초기화
+            self.prev_linear = 999.0
+            self.prev_angular = 999.0
+
             self.mark_state = "ALIGNING"
 
     def move(self, linear, angular):
@@ -211,7 +250,6 @@ class TurtlebotBridge(Node):
         msg.angular.z = float(angular)
 
         now = time.time()
-        # Throttle duplicate commands to save bandwidth
         if abs(msg.linear.x - self.prev_linear) > 0.001 or \
            abs(msg.angular.z - self.prev_angular) > 0.001 or \
            (now - self._last_cmd_time) > 0.1:
@@ -228,11 +266,16 @@ class TurtlebotBridge(Node):
         self.move(0.0, 0.0)
 
     def camera_callback(self, msg):
-        # 1. Send to Server
+        # [중요] GUI 전송 최우선
         self.put_status({'type': 'camera', 'data': {'data': bytes(msg.data)}})
 
-        # 2. Local Processing for Alignment
         if self.mark_state == "ALIGNING":
+            self.process_frame_count += 1
+
+            # 3프레임당 1번만 분석 (부하 감소)
+            if self.process_frame_count % 3 != 0:
+                return
+
             try:
                 np_arr = np.frombuffer(msg.data, np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -243,29 +286,33 @@ class TurtlebotBridge(Node):
 
                 if points is not None:
                     self.qr_visible = True
-                    pts = points.reshape(-1, 2) # FIXED TYPO
+                    pts = points.reshape(-1, 2)
 
-                    # Calculate Metrics
                     cx = np.mean(pts[:, 0])
                     cy = np.mean(pts[:, 1])
 
-                    # Angle based on top edge
                     dx = pts[1][0] - pts[0][0]
                     dy = pts[1][1] - pts[0][1]
                     angle = math.degrees(math.atan2(dy, dx))
 
-                    # Width (average of top and bottom)
                     w1 = np.linalg.norm(pts[0] - pts[1])
                     w2 = np.linalg.norm(pts[2] - pts[3])
 
                     self.last_qr_center = (cx, cy)
                     self.last_qr_angle = angle
                     self.last_qr_width = (w1 + w2) / 2.0
+                    self.last_qr_seen_time = time.time()
+
+                    if DEBUG and (self.process_frame_count % 30 == 0):
+                         self.get_logger().info(f"[QR FOUND] cx={cx:.1f}, w={self.last_qr_width:.1f}")
                 else:
                     self.qr_visible = False
-            except:
+
+            except Exception as e:
+                if DEBUG: self.get_logger().error(f"[Camera Error] {e}")
                 pass
 
+    # ... (나머지 send_nav_goal, callback 등은 기존과 동일) ...
     def send_nav_goal(self, x, y, yaw):
         if self.nav_busy:
             self.get_logger().warn("Nav Busy")
@@ -281,30 +328,20 @@ class TurtlebotBridge(Node):
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = float(x)
         goal.pose.pose.position.y = float(y)
-
-        # Yaw to Quaternion
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.nav_busy = True
-
-        if DEBUG:
-            self.get_logger().info(f"[Bridge] Sending Nav2 Goal: x={x}, y={y}, yaw={yaw}")
-
+        if DEBUG: self.get_logger().info(f"[Bridge] Sending Nav2 Goal: x={x}, y={y}, yaw={yaw}")
         future = self.nav_action_client.send_goal_async(goal)
         future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
         handle = future.result()
         if not handle.accepted:
-            self.get_logger().error("[Bridge] Nav2 Goal REJECTED")
             self.nav_busy = False
             self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Rejected'})
             return
-
-        if DEBUG:
-            self.get_logger().info("[Bridge] Nav2 Goal ACCEPTED")
-
         self._goal_handle = handle
         res_future = handle.get_result_async()
         res_future.add_done_callback(self.get_result_callback)
@@ -313,18 +350,11 @@ class TurtlebotBridge(Node):
         status = future.result().status
         self.nav_busy = False
         self._goal_handle = None
-
-        if DEBUG:
-            self.get_logger().info(f"[Bridge] Nav2 Goal Finished with Status: {status}")
-
-        # Status 4 is Succeeded
+        if DEBUG: self.get_logger().info(f"[Bridge] Nav2 Goal Finished with Status: {status}")
         self.put_status({'type': 'nav_result', 'success': (status == 4), 'reason': str(status)})
 
     def cancel_navigation(self):
-        if self._goal_handle:
-            if DEBUG:
-                self.get_logger().info("[Bridge] Canceling Navigation Goal")
-            self._goal_handle.cancel_goal_async()
+        if self._goal_handle: self._goal_handle.cancel_goal_async()
 
     def odom_callback(self, msg):
         self.put_status({'type': 'odom', 'data': {'x': msg.pose.pose.position.x, 'y': msg.pose.pose.position.y}})
