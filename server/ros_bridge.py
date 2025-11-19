@@ -1,415 +1,353 @@
-"""
-ROS2 브릿지 - 멀티프로세스 버전 (AMCL + 탈출 로직 강화)
-- AMCL 위치 보정 사용
-- 장애물 회피 시 강제 회전 (관성 부여)
-- Navigation2 연동
-"""
-
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Twist, PoseStamped, Quaternion
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import Twist, Quaternion
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage
 from nav2_msgs.action import NavigateToPose
+
 import os
 import time
 import math
+import numpy as np
+import cv2
+import subprocess
+import signal
+from cv_bridge import CvBridge
 from multiprocessing import Process, Queue
 
-def euler_to_quaternion(yaw: float) -> Quaternion:
-    """Yaw를 Quaternion으로 변환"""
-    quat = Quaternion()
-    quat.x = 0.0
-    quat.y = 0.0
-    quat.z = math.sin(yaw / 2.0)
-    quat.w = math.cos(yaw / 2.0)
-    return quat
-
 class TurtlebotBridge(Node):
-    """터틀봇 ROS2 제어 노드 (AMCL + Navigation 포함)"""
+    """
+    ROS2 Bridge Node
+    - Runs on Server
+    - Connects to Turtlebot via ROS2 (Discovery)
+    - Handles Navigation2 & Visual Servoing (MARK)
+    """
 
     def __init__(self, robot_id: int, domain_id: int,
                  command_queue: Queue, status_queue: Queue):
         super().__init__(f'bridge_robot_{robot_id}')
-
         self.robot_id = robot_id
         self.domain_id = domain_id
         self.command_queue = command_queue
         self.status_queue = status_queue
 
-        # Publishers
+        # 1. ROS2 Pub/Sub
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.initial_pose_pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/initialpose', 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.camera_sub = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, 10)
 
-        # Subscribers
-        self.amcl_sub = self.create_subscription(
-            PoseWithCovarianceStamped, '/amcl_pose',
-            self.amcl_callback, 10)
-        self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, 10)
-        self.camera_sub = self.create_subscription(
-            CompressedImage, '/camera/image_raw/compressed',
-            self.camera_callback, 10)
+        # 2. Nav2 Client & Process
+        self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.nav_process = None
+        self.nav_busy = False
+        self._goal_handle = None
 
-        # Navigation2 Action Client
-        self.nav_action_client = ActionClient(
-            self, NavigateToPose, 'navigate_to_pose')
+        # Start Nav2 Stack on Server
+        self.start_navigation_server()
 
-        # 상태 변수
-        self.current_pose_x = 0.0
-        self.current_pose_y = 0.0
-        self.current_pose_qz = 0.0
-        self.current_pose_qw = 0.0
-        self.last_scan = None
-        self.is_navigating = False
-        self.nav_goal_handle = None
+        # 3. Visual Servoing (MARK)
+        self.bridge = CvBridge()
+        self.qr_detector = cv2.QRCodeDetector()
 
-        # 탈출 회전 상태
-        self.is_escaping_turn = False
-        self.escape_turn_start_time = 0.0
-        self.escape_turn_direction = 0.0
-        self.ESCAPE_TURN_DURATION = 1.0
+        self.mark_state = "IDLE" # IDLE, ALIGNING, DONE
+        self.qr_visible = False
+        self.last_qr_center = None
+        self.last_qr_angle = 0.0
+        self.last_qr_width = 0.0
+        self.latest_frame_width = 320
 
-        # 타이머
-        self.timer = self.create_timer(0.01, self.check_commands)
+        # PID Gains for Alignment
+        self.TARGET_QR_WIDTH = 120.0 # Target size in pixels (Adjust distance)
+        self.K_CX = 0.002
+        self.K_ANG = 0.01
+        self.K_DIST = 0.0015
 
-        self.get_logger().info(
-            f'터틀봇 {robot_id} 브릿지 시작 (Domain: {domain_id})')
+        # Thresholds
+        self.THRESH_CX = 15
+        self.THRESH_ANG = 5.0
+        self.THRESH_DIST = 15.0
 
-        # Nav2 서버 대기
-        self.get_logger().info('Nav2 서버 대기 중...')
-        nav_ready = self.nav_action_client.wait_for_server(timeout_sec=5.0)
-        if nav_ready:
-            self.get_logger().info('Nav2 연결 완료!')
-        else:
-            self.get_logger().warn('Nav2 연결 실패 (자율주행 불가)')
+        # Command Throttling
+        self._last_cmd_time = 0.0
+        self.prev_linear = 0.0
+        self.prev_angular = 0.0
 
-    def amcl_callback(self, msg):
-        """AMCL 위치 보정 데이터 수신"""
-        pose = msg.pose.pose
-        self.current_pose_x = pose.position.x
-        self.current_pose_y = pose.position.y
-        self.current_pose_qz = pose.orientation.z
-        self.current_pose_qw = pose.orientation.w
+        # Main Loop (20Hz)
+        self.timer = self.create_timer(0.05, self.control_loop)
 
-        self.status_queue.put_nowait({
-            'type': 'amcl_pose',
-            'robot_id': self.robot_id,
-            'data': {
-                'x': self.current_pose_x,
-                'y': self.current_pose_y,
-                'qz': self.current_pose_qz,
-                'qw': self.current_pose_qw
-            }
-        })
+        self.get_logger().info(f"Bridge Started: Robot {robot_id} (Domain {domain_id})")
 
-    def scan_callback(self, msg):
-        """LiDAR 데이터"""
-        self.last_scan = msg.ranges
-        self.status_queue.put_nowait({
-            'type': 'scan',
-            'robot_id': self.robot_id,
-            'data': {'ranges': list(msg.ranges)}
-        })
+    def start_navigation_server(self):
+        """Launch Nav2 Stack for this robot namespace/domain"""
+        map_path = os.path.expanduser("~/maps/map.yaml")
+        if not os.path.exists(map_path):
+            self.get_logger().warn(f"Map not found at {map_path}, Nav2 might fail.")
 
-    def camera_callback(self, msg):
-        """카메라 이미지"""
-        self.status_queue.put_nowait({
-            'type': 'camera',
-            'robot_id': self.robot_id,
-            'data': {'data': bytes(msg.data), 'format': msg.format}
-        })
+        # Environment for this subprocess
+        env = os.environ.copy()
+        env['ROS_DOMAIN_ID'] = str(self.domain_id)
 
-    def check_commands(self):
-        """명령 큐 확인"""
+        # Command: Launch Nav2 (Headless)
+        # Assuming turtlebot3_navigation2 package is installed
+        cmd = [
+            'ros2', 'launch', 'turtlebot3_navigation2', 'navigation2.launch.py',
+            'use_sim_time:=False',
+            f'map:={map_path}',
+            'params_file:=/opt/ros/humble/share/turtlebot3_navigation2/param/waffle_pi.yaml'
+        ]
+
+        try:
+            # [수정] stdout=None, stderr=None으로 바꾸면 터미널에 Nav2 로그가 콸콸 쏟아집니다!
+            self.nav_process = subprocess.Popen(
+                cmd, env=env,
+                stdout=None,  # 기존: subprocess.DEVNULL
+                stderr=None,  # 기존: subprocess.PIPE
+                preexec_fn=os.setsid
+            )
+            self.get_logger().info(f"Nav2 Process Launched (PID: {self.nav_process.pid})")
+        except Exception as e:
+            self.get_logger().error(f"Failed to launch Nav2: {e}")
+
+    def control_loop(self):
+        # 1. Process External Commands
         while not self.command_queue.empty():
-            command = self.command_queue.get_nowait()
-            self.execute_command(command)
+            cmd = self.command_queue.get()
+            self.execute_command(cmd)
 
-    def execute_command(self, command: dict):
-        """명령 실행"""
-        cmd_type = command.get('command')
+        # 2. Handle Visual Servoing (MARK)
+        if self.mark_state == "ALIGNING":
+            self.process_alignment()
 
-        if cmd_type == 'move':
-            linear = command.get('linear', 0.0)
-            angular = command.get('angular', 0.0)
-            self.move(linear, angular)
+    def process_alignment(self):
+        if self.nav_busy: return # Priority to Nav
 
-        elif cmd_type == 'stop':
+        if not self.qr_visible or self.last_qr_center is None:
+            # Lost QR -> Rotate slowly to find it
+            self.move(0.0, 0.2)
+            return
+
+        cx, cy = self.last_qr_center
+        angle = self.last_qr_angle
+        width = self.last_qr_width
+
+        img_cx = self.latest_frame_width // 2
+        err_cx = cx - img_cx
+        err_ang = angle
+        err_dist = self.TARGET_QR_WIDTH - width
+
+        # Check Success
+        if abs(err_cx) < self.THRESH_CX and \
+           abs(err_ang) < self.THRESH_ANG and \
+           abs(err_dist) < self.THRESH_DIST:
+
             self.stop()
+            self.mark_state = "DONE"
+            self.put_status({'type': 'mark_complete'})
+            self.get_logger().info("Mark Alignment Complete")
 
-        elif cmd_type == 'navigate_to':
-            x = command.get('x', 0.0)
-            y = command.get('y', 0.0)
-            yaw = command.get('yaw', 0.0)
-            self.navigate_to(x, y, yaw)
+            # Reset to IDLE after a moment
+            self.mark_state = "IDLE"
+            return
 
-        elif cmd_type == 'cancel_navigation':
+        # PID Control
+        # X Error -> Turn
+        # Angle Error -> Turn
+        # Width Error (Distance) -> Move Forward/Back
+
+        ang_spd = -(self.K_CX * err_cx) - (self.K_ANG * err_ang)
+        lin_spd = self.K_DIST * err_dist
+
+        # Clamp
+        lin_spd = np.clip(lin_spd, -0.1, 0.1)
+        ang_spd = np.clip(ang_spd, -0.5, 0.5)
+
+        self.move(lin_spd, ang_spd)
+
+    def execute_command(self, cmd: dict):
+        c_type = cmd.get('command')
+
+        if c_type == 'move':
+            if not self.nav_busy and self.mark_state == "IDLE":
+                self.move(cmd.get('linear'), cmd.get('angular'))
+
+        elif c_type == 'stop':
+            self.stop()
+            if self.nav_busy: self.cancel_navigation()
+            self.mark_state = "IDLE"
+
+        elif c_type == 'navigate_to_pose':
+            self.send_nav_goal(cmd.get('x'), cmd.get('y'), cmd.get('yaw'))
+
+        elif c_type == 'cancel_navigation':
             self.cancel_navigation()
 
-        elif cmd_type == 'escape_turn':
-            direction = command.get('direction', 0.5)
-            self.start_escape_turn(direction)
+        elif c_type == 'start_mark_alignment':
+            self.get_logger().info("Starting MARK Alignment")
+            self.mark_state = "ALIGNING"
 
-    def move(self, linear: float, angular: float):
-        """수동 이동"""
+    def move(self, linear, angular):
         msg = Twist()
         msg.linear.x = float(linear)
         msg.angular.z = float(angular)
-        self.cmd_vel_pub.publish(msg)
+
+        now = time.time()
+        # Throttle duplicate commands to save bandwidth
+        if abs(msg.linear.x - self.prev_linear) > 0.001 or \
+           abs(msg.angular.z - self.prev_angular) > 0.001 or \
+           (now - self._last_cmd_time) > 0.1:
+
+            self.cmd_vel_pub.publish(msg)
+            self.prev_linear = msg.linear.x
+            self.prev_angular = msg.angular.z
+            self._last_cmd_time = now
 
     def stop(self):
-        """정지"""
-        msg = Twist()
-        self.cmd_vel_pub.publish(msg)
-        self.is_escaping_turn = False
-        self.get_logger().info('정지')
+        self.move(0.0, 0.0)
 
-    def start_escape_turn(self, angular_direction: float):
-        """장애물 탈출 회전 시작 (1초 강제 유지)"""
-        self.is_escaping_turn = True
-        self.escape_turn_start_time = time.time()
-        self.escape_turn_direction = angular_direction
+    def camera_callback(self, msg):
+        # 1. Send to Server
+        self.put_status({'type': 'camera', 'data': {'data': bytes(msg.data)}})
 
-        self.get_logger().info(
-            f'탈출 회전 시작: {angular_direction:.2f} rad/s (1초 유지)')
+        # 2. Local Processing for Alignment
+        if self.mark_state == "ALIGNING":
+            try:
+                np_arr = np.frombuffer(msg.data, np.uint8)
+                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                self.latest_frame_width = img.shape[1]
 
-        # 회전 명령 발행
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = angular_direction
-        self.cmd_vel_pub.publish(twist)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                _, points, _ = self.qr_detector.detectAndDecode(gray)
 
-    def navigate_to(self, x: float, y: float, yaw: float = 0.0):
-        """Navigation2 목표 전송"""
-        if self.is_navigating:
-            self.get_logger().warn('이미 이동 중 - 취소 후 재시작')
-            self.cancel_navigation()
+                if points is not None:
+                    self.qr_visible = True
+                    pts = points.reshape(-1, 2) # FIXED TYPO
 
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = self._create_pose(x, y, yaw)
+                    # Calculate Metrics
+                    cx = np.mean(pts[:, 0])
+                    cy = np.mean(pts[:, 1])
 
-        self.get_logger().info(
-            f'Nav2 Goal: x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f}°')
+                    # Angle based on top edge
+                    dx = pts[1][0] - pts[0][0]
+                    dy = pts[1][1] - pts[0][1]
+                    angle = math.degrees(math.atan2(dy, dx))
 
-        send_future = self.nav_action_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self._nav_feedback_callback
-        )
-        send_future.add_done_callback(self._nav_response_callback)
+                    # Width (average of top and bottom)
+                    w1 = np.linalg.norm(pts[0] - pts[1])
+                    w2 = np.linalg.norm(pts[2] - pts[3])
 
-        self.is_navigating = True
+                    self.last_qr_center = (cx, cy)
+                    self.last_qr_angle = angle
+                    self.last_qr_width = (w1 + w2) / 2.0
+                else:
+                    self.qr_visible = False
+            except:
+                pass
 
-    def _create_pose(self, x: float, y: float, yaw: float) -> PoseStamped:
-        """PoseStamped 생성"""
-        pose = PoseStamped()
-        pose.header.frame_id = 'map'
-        pose.header.stamp = self.get_clock().now().to_msg()
-
-        pose.pose.position.x = x
-        pose.pose.position.y = y
-        pose.pose.position.z = 0.0
-
-        pose.pose.orientation = euler_to_quaternion(yaw)
-
-        return pose
-
-    def _nav_response_callback(self, future):
-        """Nav2 Goal 응답"""
-        goal_handle = future.result()
-
-        if not goal_handle.accepted:
-            self.get_logger().error('Goal 거부됨')
-            self.is_navigating = False
-            self._send_nav_status('failed', 'goal_rejected')
+    def send_nav_goal(self, x, y, yaw):
+        if self.nav_busy:
+            self.get_logger().warn("Nav Busy")
             return
 
-        self.get_logger().info('Goal 수락됨')
-        self.nav_goal_handle = goal_handle
+        if not self.nav_action_client.wait_for_server(timeout_sec=20.0):
+            self.get_logger().error("Nav2 Action Server Not Ready")
+            self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Nav2 Not Ready'})
+            return
 
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._nav_result_callback)
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
 
-    def _nav_feedback_callback(self, feedback_msg):
-        """Nav2 피드백"""
-        feedback = feedback_msg.feedback
-        x = feedback.current_pose.pose.position.x
-        y = feedback.current_pose.pose.position.y
+        # Yaw to Quaternion
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
-        self.status_queue.put_nowait({
-            'type': 'nav_feedback',
-            'robot_id': self.robot_id,
-            'x': x,
-            'y': y
-        })
+        self.nav_busy = True
+        future = self.nav_action_client.send_goal_async(goal)
+        future.add_done_callback(self.goal_response_callback)
 
-    def _nav_result_callback(self, future):
-        """Nav2 결과"""
+    def goal_response_callback(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.nav_busy = False
+            self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Rejected'})
+            return
+
+        self._goal_handle = handle
+        res_future = handle.get_result_async()
+        res_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
         status = future.result().status
-
-        self.is_navigating = False
-        self.nav_goal_handle = None
-
-        if status == 4:
-            self.get_logger().info('목표 도착!')
-            self._send_nav_status('complete', 'arrived')
-        else:
-            self.get_logger().warn(f'이동 실패 (status={status})')
-            self._send_nav_status('failed', f'status_{status}')
-
-    def _send_nav_status(self, result: str, reason: str = ''):
-        """Navigation 상태를 서버로 전송"""
-        self.status_queue.put_nowait({
-            'type': 'nav_status',
-            'robot_id': self.robot_id,
-            'result': result,
-            'reason': reason
-        })
+        self.nav_busy = False
+        self._goal_handle = None
+        # Status 4 is Succeeded
+        self.put_status({'type': 'nav_result', 'success': (status == 4), 'reason': str(status)})
 
     def cancel_navigation(self):
-        """Navigation 취소"""
-        if not self.is_navigating or not self.nav_goal_handle:
-            self.get_logger().warn('취소할 이동 없음')
-            return
+        if self._goal_handle:
+            self._goal_handle.cancel_goal_async()
 
-        self.get_logger().info('이동 취소 요청')
-        cancel_future = self.nav_goal_handle.cancel_goal_async()
-        cancel_future.add_done_callback(self._cancel_callback)
+    def odom_callback(self, msg):
+        self.put_status({'type': 'odom', 'data': {'x': msg.pose.pose.position.x, 'y': msg.pose.pose.position.y}})
 
-    def _cancel_callback(self, future):
-        """취소 응답"""
-        cancel_response = future.result()
+    def scan_callback(self, msg):
+        self.put_status({'type': 'scan', 'data': {'ranges': list(msg.ranges)}})
 
-        if len(cancel_response.goals_canceling) > 0:
-            self.get_logger().info('취소 완료')
-        else:
-            self.get_logger().warn('취소 실패')
+    def put_status(self, data):
+        try:
+            data['robot_id'] = self.robot_id
+            self.status_queue.put_nowait(data)
+        except: pass
 
-        self.is_navigating = False
-        self.nav_goal_handle = None
+    def __del__(self):
+        if self.nav_process:
+            os.killpg(os.getpgid(self.nav_process.pid), signal.SIGTERM)
 
-def run_bridge_process(robot_id: int, domain_id: int,
-                      command_queue: Queue, status_queue: Queue):
-    """브릿지 프로세스 메인"""
-    os.environ['ROS_DOMAIN_ID'] = str(domain_id)
-
+# --- Process Manager ---
+def run_bridge_process(rid, did, cmd_q, stat_q):
+    os.environ['ROS_DOMAIN_ID'] = str(did)
     rclpy.init()
-    bridge = TurtlebotBridge(robot_id, domain_id, command_queue, status_queue)
-
-    rclpy.spin(bridge)
-
-    bridge.destroy_node()
-    rclpy.shutdown()
+    node = TurtlebotBridge(rid, did, cmd_q, stat_q)
+    try: rclpy.spin(node)
+    except: pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 class MultiRobotManager:
-    """멀티 로봇 관리자"""
-
     def __init__(self):
         self.processes = {}
-        self.command_queues = {}
-        self.status_queues = {}
-        print("[매니저] 생성")
+        self.cmd_qs = {}
+        self.stat_qs = {}
 
-    def add_robot(self, robot_id: int, domain_id: int):
-        """로봇 추가"""
-        if robot_id in self.processes:
-            print(f"[매니저] 로봇 {robot_id} 이미 존재")
-            return False
-
-        cmd_q = Queue()
-        stat_q = Queue()
-
-        p = Process(target=run_bridge_process,
-                   args=(robot_id, domain_id, cmd_q, stat_q))
+    def add_robot(self, rid, did):
+        if rid in self.processes: return
+        cq, sq = Queue(), Queue()
+        p = Process(target=run_bridge_process, args=(rid, did, cq, sq))
         p.start()
+        self.processes[rid] = p
+        self.cmd_qs[rid] = cq
+        self.stat_qs[rid] = sq
 
-        self.processes[robot_id] = p
-        self.command_queues[robot_id] = cmd_q
-        self.status_queues[robot_id] = stat_q
+    def send_command(self, rid, cmd):
+        if rid in self.cmd_qs: self.cmd_qs[rid].put(cmd)
 
-        print(f"[매니저] 터틀봇 {robot_id} 추가 (Domain: {domain_id}, PID: {p.pid})")
-        time.sleep(0.5)
-
-        return True
-
-    def send_command(self, robot_id: int, command: dict):
-        """명령 전송"""
-        if robot_id not in self.command_queues:
-            return False
-
-        self.command_queues[robot_id].put(command)
-        return True
-
-    def move_robot(self, robot_id: int, linear: float, angular: float):
-        """이동"""
-        return self.send_command(robot_id, {
-            'command': 'move',
-            'linear': linear,
-            'angular': angular
-        })
-
-    def stop_robot(self, robot_id: int):
-        """정지"""
-        return self.send_command(robot_id, {'command': 'stop'})
-
-    def navigate_to(self, robot_id: int, x: float, y: float, yaw: float = 0.0):
-        """Navigation 이동"""
-        return self.send_command(robot_id, {
-            'command': 'navigate_to',
-            'x': x,
-            'y': y,
-            'yaw': yaw
-        })
-
-    def cancel_navigation(self, robot_id: int):
-        """Navigation 취소"""
-        return self.send_command(robot_id, {'command': 'cancel_navigation'})
-
-    def escape_turn(self, robot_id: int, angular_direction: float):
-        """탈출 회전 명령"""
-        return self.send_command(robot_id, {
-            'command': 'escape_turn',
-            'direction': angular_direction
-        })
-
-    def get_status(self, robot_id: int):
-        """상태 가져오기"""
-        if robot_id not in self.status_queues:
-            return None
-
-        try:
-            return self.status_queues[robot_id].get_nowait()
-        except:
-            return None
+    def move_robot(self, rid, l, a): self.send_command(rid, {'command': 'move', 'linear': l, 'angular': a}); return True
+    def stop_robot(self, rid): self.send_command(rid, {'command': 'stop'}); return True
+    def navigate_to_pose(self, rid, x, y, yaw): self.send_command(rid, {'command': 'navigate_to_pose', 'x': x, 'y': y, 'yaw': yaw}); return True
+    def cancel_navigation(self, rid): self.send_command(rid, {'command': 'cancel_navigation'}); return True
 
     def get_all_status(self):
-        """모든 상태"""
-        all_status = {}
-
-        for robot_id in self.status_queues.keys():
-            statuses = []
-            while True:
-                status = self.get_status(robot_id)
-                if status is None:
-                    break
-                statuses.append(status)
-
-            if statuses:
-                all_status[robot_id] = statuses
-
-        return all_status
+        res = {}
+        for rid, sq in self.stat_qs.items():
+            msgs = []
+            while not sq.empty(): msgs.append(sq.get())
+            if msgs: res[rid] = msgs
+        return res
 
     def shutdown(self):
-        """종료"""
-        for robot_id, p in self.processes.items():
-            print(f"[매니저] 로봇 {robot_id} 종료")
-            p.terminate()
-            p.join(timeout=2)
-            if p.is_alive():
-                p.kill()
-
-        self.processes.clear()
-        self.command_queues.clear()
-        self.status_queues.clear()
+        for p in self.processes.values(): p.terminate()

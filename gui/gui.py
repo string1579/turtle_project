@@ -1,30 +1,29 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-터틀봇 제어 GUI (PyQt5) + Navigation2 + 카메라 영상
-- WebSocket으로 서버와 실시간 통신
-- 로봇 제어 및 상태 모니터링
-- Navigation 좌표 이동 기능
-- 카메라 영상 실시간 표시
+Turtlebot Control GUI (PyQt5 + WebSocket)
+- Integrated team design
+- WebSocket communication
+- Multi-robot support
+- Navigation2, QR, Collision Avoidance
+- NO EMOJIS
 """
 
 import sys
 import json
 import os
-
-if sys.platform == 'win32':
-    import locale
-    locale.setlocale(locale.LC_ALL, '')
+import datetime
+import math
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QLabel, QGroupBox, QComboBox, QGridLayout,
-    QLineEdit
+    QApplication, QMainWindow, QMessageBox, QDialog,
+    QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QGroupBox, QGridLayout
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QFont, QImage, QPixmap
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
+from PyQt5.QtGui import QImage, QPixmap
 
 import websocket
-import cv2
-import numpy as np
 
 try:
     from shared.config import ROBOTS, SERVER_IP, SERVER_PORT
@@ -32,12 +31,73 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from shared.config import ROBOTS, SERVER_IP, SERVER_PORT
 
-class WebSocketThread(QThread):
-    """WebSocket 통신 스레드"""
+from gui.ui_main_window import Ui_video_label
 
-    message_received = pyqtSignal(str)
+class NavigationDialog(QDialog):
+    """Dialog for Navigation Coordinates Input"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Move to Coordinate")
+        self.setModal(True)
+        self.setMinimumWidth(350)
+
+        layout = QVBoxLayout()
+
+        # Coordinate Input
+        coord_group = QGroupBox("Target Coordinates")
+        coord_layout = QGridLayout()
+
+        coord_layout.addWidget(QLabel("X (m):"), 0, 0)
+        self.x_input = QLineEdit("2.0")
+        coord_layout.addWidget(self.x_input, 0, 1)
+
+        coord_layout.addWidget(QLabel("Y (m):"), 1, 0)
+        self.y_input = QLineEdit("1.0")
+        coord_layout.addWidget(self.y_input, 1, 1)
+
+        coord_layout.addWidget(QLabel("Yaw (deg):"), 2, 0)
+        self.yaw_input = QLineEdit("0")
+        coord_layout.addWidget(self.yaw_input, 2, 1)
+
+        coord_group.setLayout(coord_layout)
+        layout.addWidget(coord_group)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        self.btn_move = QPushButton("Start")
+        self.btn_move.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
+        self.btn_move.clicked.connect(self.accept)
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setStyleSheet("background-color: #f44336; color: white; padding: 10px;")
+        self.btn_cancel.clicked.connect(self.reject)
+
+        button_layout.addWidget(self.btn_move)
+        button_layout.addWidget(self.btn_cancel)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def get_coordinates(self):
+        """Returns entered coordinates"""
+        try:
+            x = float(self.x_input.text())
+            y = float(self.y_input.text())
+            yaw_deg = float(self.yaw_input.text())
+            yaw_rad = yaw_deg * math.pi / 180.0
+            return (x, y, yaw_rad)
+        except ValueError:
+            return None
+
+class WebSocketThread(QThread):
+    """WebSocket Communication Thread"""
+
+    message_received = pyqtSignal(dict)
     connection_status = pyqtSignal(bool)
-    camera_image_received = pyqtSignal(np.ndarray)
+    # Signal now includes robot_id: (robot_id, image)
+    camera_image_received = pyqtSignal(int, object)
 
     def __init__(self):
         super().__init__()
@@ -59,548 +119,631 @@ class WebSocketThread(QThread):
         self.ws.run_forever()
 
     def on_open(self, ws):
-        self.message_received.emit("서버 연결 성공!")
+        print("[WebSocket] Connected to Server")
         self.connection_status.emit(True)
 
     def on_message(self, ws, message):
-        # JSON 메시지 처리
         try:
             msg_dict = json.loads(message)
             msg_type = msg_dict.get('type')
 
-            # 카메라 이미지는 별도 시그널로 전달
+            # Camera Image Handling
             if msg_type == 'camera_image':
                 img_data = msg_dict.get('image_data')
-                if img_data:
+                robot_id = msg_dict.get('robot_id')
+
+                if img_data and robot_id is not None:
+                    import numpy as np
+                    import cv2
+
                     np_arr = np.frombuffer(bytes.fromhex(img_data), np.uint8)
                     cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                    self.camera_image_received.emit(cv_image)
+
+                    # Emit robot_id along with image for filtering
+                    self.camera_image_received.emit(robot_id, cv_image)
                 return
 
-        except json.JSONDecodeError:
-            pass
+            # General Message
+            self.message_received.emit(msg_dict)
 
-        self.message_received.emit(message)
+        except json.JSONDecodeError:
+            print(f"[WebSocket] JSON Error: {message[:50]}...")
+        except Exception as e:
+            print(f"[WebSocket] Processing Error: {e}")
 
     def on_error(self, ws, error):
-        self.message_received.emit(f"에러: {error}")
+        print(f"[WebSocket] Error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
-        self.message_received.emit("연결 종료됨")
+        print("[WebSocket] Disconnected")
         self.connection_status.emit(False)
         self.running = False
 
     def send(self, message: dict):
-        """메시지 전송"""
         if self.ws and self.running:
             json_msg = json.dumps(message)
             self.ws.send(json_msg)
-            print(f"[전송] {json_msg}")
 
     def stop(self):
         self.running = False
         if self.ws:
             self.ws.close()
 
-class TurtlebotGUI(QMainWindow):
-    """터틀봇 제어 GUI 메인 창"""
+class RobotControlWindow(QMainWindow, Ui_video_label):
+    """Main GUI Window"""
 
     def __init__(self):
         super().__init__()
+        self.setupUi(self)
 
-        self.selected_robot = 1
+        # Robot Setup
+        self.robot_map = {}
+        for robot_id, info in ROBOTS.items():
+            display_name = f"{info['name']} (ID: {robot_id})"
+            self.robot_map[display_name] = robot_id
+
+        self.display_names = list(self.robot_map.keys())
+        self.current_robot_id = list(ROBOTS.keys())[0] if ROBOTS else 1
+
+        # Status Variables
         self.connected = False
+        self.emergency_stop_active = False
+        self.manual_mode_active = False
+
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.origin_offset_x = 0.0
+        self.origin_offset_y = 0.0
+        self.current_yaw = 0.0
+        self.front_distance = float('inf')
+        self.current_battery_voltage = 0.0
+        self.max_linear_limit = 0.15
+
+        # Velocity Control
+        self.target_linear_vel = 0.0
+        self.target_angular_vel = 0.0
+
+        # Trip Info
+        self.total_distance = 0.0
+        self.prev_x = None
+        self.prev_y = None
+        self.start_time = datetime.datetime.now()
+
+        # States
         self.qr_active = False
         self.lidar_active = False
+        self.is_navigating = False
 
+        # Camera Frame
+        self.current_cv_frame = None
+
+        # Init
         self.init_ui()
         self.connect_to_server()
 
+        # Timer (10Hz)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_loop)
+        self.timer.start(100)
+
+        print("=" * 60)
+        print("GUI Started")
+        print(f"Server: {SERVER_IP}:{SERVER_PORT}")
+        print("=" * 60)
+
     def init_ui(self):
-        """UI 초기화"""
-        self.setWindowTitle("터틀봇 제어 GUI v2.2 (카메라 포함)")
-        self.setGeometry(100, 100, 1200, 900)
+        # Robot Selector
+        if hasattr(self, 'combo_robot_select'):
+            self.combo_robot_select.clear()
+            self.combo_robot_select.addItems(self.display_names)
+            self.combo_robot_select.activated[str].connect(self.on_robot_changed)
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
+        # Direction Buttons
+        self.btn_forward.pressed.connect(lambda: self.set_velocity(1.0, 0.0))
+        self.btn_backward.pressed.connect(lambda: self.set_velocity(-1.0, 0.0))
+        self.btn_left.pressed.connect(lambda: self.set_velocity(0.0, 0.8))
+        self.btn_right.pressed.connect(lambda: self.set_velocity(0.0, -0.8))
+        self.btn_stop.clicked.connect(self.set_stop_velocity)
 
-        # 좌측: 제어 패널
-        left_frame = QWidget()
-        left_layout = QVBoxLayout(left_frame)
-        left_layout.addWidget(self.create_robot_selector())
-        left_layout.addWidget(self.create_control_group())
-        left_layout.addWidget(self.create_navigation_group())
-        left_layout.addWidget(self.create_mode_group())
-        left_layout.addWidget(self.create_status_group())
+        for btn in [self.btn_forward, self.btn_backward, self.btn_left, self.btn_right]:
+            btn.released.connect(self.set_stop_velocity)
 
-        # 우측: 카메라 영상
-        right_frame = QWidget()
-        right_layout = QVBoxLayout(right_frame)
-        right_layout.addWidget(self.create_camera_group())
+        # Mode Buttons
+        self.btn_manual_mode.toggled.connect(self.on_manual_mode_toggled)
+        self.btn_emergency_stop.toggled.connect(self.on_emergency_stop_toggled)
 
-        main_layout.addWidget(left_frame, stretch=1)
-        main_layout.addWidget(right_frame, stretch=1)
+        # Feature Buttons
+        if hasattr(self, 'btn_set_origin'):
+            self.btn_set_origin.clicked.connect(self.on_set_origin_clicked)
+        if hasattr(self, 'btn_return_origin'):
+            self.btn_return_origin.clicked.connect(self.on_return_to_origin_clicked)
+            self.btn_return_origin.setEnabled(False)
+        if hasattr(self, 'btn_screenshot'):
+            self.btn_screenshot.clicked.connect(self.on_screenshot_clicked)
+        if hasattr(self, 'btn_reset_trip'):
+            self.btn_reset_trip.clicked.connect(self.on_reset_trip)
 
-    def create_robot_selector(self):
-        """로봇 선택 그룹"""
-        group = QGroupBox("로봇 선택")
-        layout = QHBoxLayout()
+        # Slider
+        if hasattr(self, 'slider_speed'):
+            self.slider_speed.valueChanged.connect(self.update_max_speed)
+            self.update_max_speed(self.slider_speed.value())
 
-        self.robot_combo = QComboBox()
-        for robot_id, info in ROBOTS.items():
-            self.robot_combo.addItem(
-                f"{info['name']} (ID: {robot_id})",
-                robot_id
-            )
-        self.robot_combo.currentIndexChanged.connect(self.on_robot_changed)
+        self.add_advanced_controls()
 
-        layout.addWidget(QLabel("제어할 로봇:"))
-        layout.addWidget(self.robot_combo)
-        layout.addStretch()
+        # Init State
+        self.btn_manual_mode.setChecked(False)
+        self.on_manual_mode_toggled(False)
 
-        group.setLayout(layout)
-        return group
+    def add_advanced_controls(self):
+        if hasattr(self, 'centralwidget'):
+            main_layout = self.centralwidget.layout()
 
-    def create_control_group(self):
-        """방향 제어 그룹"""
-        group = QGroupBox("수동 제어 (방향키)")
-        layout = QVBoxLayout()
-        grid = QGridLayout()
+            advanced_group = QGroupBox("Advanced Features")
+            advanced_layout = QHBoxLayout()
 
-        # 전진
-        self.btn_forward = QPushButton("전진\n↑")
-        self.btn_forward.setMinimumSize(120, 80)
-        self.btn_forward.pressed.connect(lambda: self.send_move(0.2, 0.0))
-        self.btn_forward.released.connect(self.send_stop)
-        grid.addWidget(self.btn_forward, 0, 1)
+            # Navigation
+            self.btn_navigate = QPushButton("Move to Coord")
+            self.btn_navigate.setMinimumHeight(35)
+            self.btn_navigate.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+            self.btn_navigate.clicked.connect(self.on_navigate_clicked)
+            advanced_layout.addWidget(self.btn_navigate)
 
-        # 좌회전
-        self.btn_left = QPushButton("좌회전\n←")
-        self.btn_left.setMinimumSize(120, 80)
-        self.btn_left.pressed.connect(lambda: self.send_move(0.0, 0.5))
-        self.btn_left.released.connect(self.send_stop)
-        grid.addWidget(self.btn_left, 1, 0)
+            self.btn_cancel_nav = QPushButton("Cancel Move")
+            self.btn_cancel_nav.setMinimumHeight(35)
+            self.btn_cancel_nav.setStyleSheet("background-color: #FF9800; color: white;")
+            self.btn_cancel_nav.clicked.connect(self.on_cancel_nav_clicked)
+            advanced_layout.addWidget(self.btn_cancel_nav)
 
-        # 정지
-        self.btn_stop = QPushButton("정지\n■")
-        self.btn_stop.setMinimumSize(120, 80)
-        self.btn_stop.setStyleSheet(
-            "background-color: #ff4444; color: white; "
-            "font-size: 14px; font-weight: bold;"
-        )
-        self.btn_stop.clicked.connect(self.send_stop)
-        grid.addWidget(self.btn_stop, 1, 1)
+            # QR
+            self.btn_qr_toggle = QPushButton("Start QR Scan")
+            self.btn_qr_toggle.setMinimumHeight(35)
+            self.btn_qr_toggle.setCheckable(True)
+            self.btn_qr_toggle.toggled.connect(self.on_qr_toggled)
+            advanced_layout.addWidget(self.btn_qr_toggle)
 
-        # 우회전
-        self.btn_right = QPushButton("우회전\n→")
-        self.btn_right.setMinimumSize(120, 80)
-        self.btn_right.pressed.connect(lambda: self.send_move(0.0, -0.5))
-        self.btn_right.released.connect(self.send_stop)
-        grid.addWidget(self.btn_right, 1, 2)
+            # LiDAR
+            self.btn_lidar_toggle = QPushButton("Start Collision Check")
+            self.btn_lidar_toggle.setMinimumHeight(35)
+            self.btn_lidar_toggle.setCheckable(True)
+            self.btn_lidar_toggle.toggled.connect(self.on_lidar_toggled)
+            advanced_layout.addWidget(self.btn_lidar_toggle)
 
-        # 후진
-        self.btn_backward = QPushButton("후진\n↓")
-        self.btn_backward.setMinimumSize(120, 80)
-        self.btn_backward.pressed.connect(lambda: self.send_move(-0.2, 0.0))
-        self.btn_backward.released.connect(self.send_stop)
-        grid.addWidget(self.btn_backward, 2, 1)
+            advanced_group.setLayout(advanced_layout)
 
-        layout.addLayout(grid)
-        group.setLayout(layout)
-        return group
+            if main_layout:
+                main_layout.addWidget(advanced_group, main_layout.rowCount(), 0, 1, 2)
 
-    def create_navigation_group(self):
-        """Navigation 제어 그룹"""
-        group = QGroupBox("Navigation (자율주행)")
-        layout = QVBoxLayout()
+        if hasattr(self, 'statusbar'):
+            self.nav_status_label = QLabel("Nav: Idle")
+            self.nav_status_label.setStyleSheet("color: white; padding: 5px;")
+            self.statusbar.addPermanentWidget(self.nav_status_label)
 
-        # 좌표 입력
-        coord_layout = QHBoxLayout()
+            self.qr_status_label = QLabel("QR: OFF")
+            self.qr_status_label.setStyleSheet("color: gray; padding: 5px;")
+            self.statusbar.addPermanentWidget(self.qr_status_label)
 
-        coord_layout.addWidget(QLabel("목표 좌표:"))
-
-        coord_layout.addWidget(QLabel("X:"))
-        self.nav_x_input = QLineEdit("2.0")
-        self.nav_x_input.setMaximumWidth(80)
-        coord_layout.addWidget(self.nav_x_input)
-
-        coord_layout.addWidget(QLabel("Y:"))
-        self.nav_y_input = QLineEdit("1.0")
-        self.nav_y_input.setMaximumWidth(80)
-        coord_layout.addWidget(self.nav_y_input)
-
-        coord_layout.addWidget(QLabel("Yaw(°):"))
-        self.nav_yaw_input = QLineEdit("0")
-        self.nav_yaw_input.setMaximumWidth(80)
-        coord_layout.addWidget(self.nav_yaw_input)
-
-        coord_layout.addStretch()
-
-        # 버튼
-        button_layout = QHBoxLayout()
-
-        self.btn_navigate = QPushButton("좌표로 이동")
-        self.btn_navigate.setMinimumHeight(40)
-        self.btn_navigate.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
-        self.btn_navigate.clicked.connect(self.navigate_to_goal)
-
-        self.btn_cancel_nav = QPushButton("이동 취소")
-        self.btn_cancel_nav.setMinimumHeight(40)
-        self.btn_cancel_nav.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
-        self.btn_cancel_nav.clicked.connect(self.cancel_navigation)
-
-        button_layout.addWidget(self.btn_navigate)
-        button_layout.addWidget(self.btn_cancel_nav)
-
-        # 상태 표시
-        self.nav_status_label = QLabel("Navigation: 대기 중")
-        self.nav_status_label.setStyleSheet("color: gray; font-size: 12px;")
-
-        layout.addLayout(coord_layout)
-        layout.addLayout(button_layout)
-        layout.addWidget(self.nav_status_label)
-
-        group.setLayout(layout)
-        return group
-
-    def create_mode_group(self):
-        """모드 제어 그룹"""
-        group = QGroupBox("센서 모드")
-        layout = QVBoxLayout()
-
-        # QR 인식
-        qr_layout = QHBoxLayout()
-        self.btn_qr_start = QPushButton("QR 인식 시작")
-        self.btn_qr_start.clicked.connect(self.start_qr_detection)
-        self.btn_qr_stop = QPushButton("QR 중지")
-        self.btn_qr_stop.clicked.connect(self.stop_qr_detection)
-        self.btn_qr_stop.setEnabled(False)
-        qr_layout.addWidget(self.btn_qr_start)
-        qr_layout.addWidget(self.btn_qr_stop)
-
-        # LiDAR 충돌 체크
-        lidar_layout = QHBoxLayout()
-        self.btn_lidar_start = QPushButton("충돌 체크 시작")
-        self.btn_lidar_start.clicked.connect(self.start_lidar_check)
-        self.btn_lidar_stop = QPushButton("충돌 체크 중지")
-        self.btn_lidar_stop.clicked.connect(self.stop_lidar_check)
-        self.btn_lidar_stop.setEnabled(False)
-        lidar_layout.addWidget(self.btn_lidar_start)
-        lidar_layout.addWidget(self.btn_lidar_stop)
-
-        # 상태 라벨
-        self.qr_status_label = QLabel("QR: 대기 중")
-        self.qr_status_label.setStyleSheet("color: gray;")
-        self.lidar_status_label = QLabel("충돌 체크: 대기 중")
-        self.lidar_status_label.setStyleSheet("color: gray;")
-
-        layout.addLayout(qr_layout)
-        layout.addWidget(self.qr_status_label)
-        layout.addLayout(lidar_layout)
-        layout.addWidget(self.lidar_status_label)
-
-        group.setLayout(layout)
-        return group
-
-    def create_camera_group(self):
-        """카메라 영상 표시 그룹"""
-        group = QGroupBox("카메라 영상")
-        layout = QVBoxLayout()
-
-        self.camera_label = QLabel("영상 수신 대기 중...")
-        self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(640, 480)
-        self.camera_label.setStyleSheet("background-color: black; color: white;")
-
-        layout.addWidget(self.camera_label)
-        group.setLayout(layout)
-        return group
-
-    def create_status_group(self):
-        """상태 표시 그룹"""
-        group = QGroupBox("상태")
-        layout = QVBoxLayout()
-
-        self.status_label = QLabel("서버 연결 대기 중...")
-        self.status_label.setFont(QFont("Arial", 12, QFont.Bold))
-        layout.addWidget(self.status_label)
-
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumHeight(150)
-        layout.addWidget(self.log)
-
-        group.setLayout(layout)
-        return group
+            self.lidar_status_label = QLabel("Collision: OFF")
+            self.lidar_status_label.setStyleSheet("color: gray; padding: 5px;")
+            self.statusbar.addPermanentWidget(self.lidar_status_label)
 
     def connect_to_server(self):
-        """서버 연결"""
         self.ws_thread = WebSocketThread()
-        self.ws_thread.message_received.connect(self.on_message)
+        self.ws_thread.message_received.connect(self.on_websocket_message)
         self.ws_thread.connection_status.connect(self.on_connection_changed)
         self.ws_thread.camera_image_received.connect(self.update_camera_image)
         self.ws_thread.start()
 
-    def on_robot_changed(self, index):
-        """로봇 선택 변경"""
-        self.selected_robot = self.robot_combo.currentData()
-        robot_name = ROBOTS[self.selected_robot]['name']
-        self.add_log(f"선택: {robot_name}")
-
-    def send_move(self, linear: float, angular: float):
-        """이동 명령"""
-        if not self.connected:
-            self.add_log("에러: 서버 연결 안됨")
+    def on_robot_changed(self, display_name):
+        robot_id = self.robot_map.get(display_name)
+        if robot_id is None:
             return
 
-        message = {
-            "command": "move",
-            "robot_id": self.selected_robot,
-            "linear": linear,
-            "angular": angular
-        }
-        self.ws_thread.send(message)
+        self.current_robot_id = robot_id
 
-    def send_stop(self):
-        """정지 명령"""
+        # Request camera stream for the new robot
+        if self.connected:
+            self.start_camera_stream()
+
+        self.on_reset_trip()
+        self.set_stop_velocity()
+        print(f"[Robot Switched] {display_name}")
+
+    def start_camera_stream(self):
         if not self.connected:
             return
 
-        message = {
-            "command": "stop",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-        self.add_log("정지")
+        self.ws_thread.send({
+            "command": "camera_start",
+            "robot_id": self.current_robot_id
+        })
 
-    def navigate_to_goal(self):
-        """Navigation: 목표 좌표로 이동"""
-        if not self.connected:
-            self.add_log("에러: 서버 연결 안됨")
+    def on_manual_mode_toggled(self, checked):
+        if self.emergency_stop_active:
+            self.btn_manual_mode.setChecked(not checked)
             return
 
-        try:
-            x = float(self.nav_x_input.text())
-            y = float(self.nav_y_input.text())
-            yaw_deg = float(self.nav_yaw_input.text())
-            yaw_rad = yaw_deg * 3.14159 / 180.0
+        self.manual_mode_active = checked
 
-            message = {
-                "command": "navigate_to",
-                "robot_id": self.selected_robot,
-                "x": x,
-                "y": y,
-                "yaw": yaw_rad
-            }
-            self.ws_thread.send(message)
-
-            self.nav_status_label.setText(f"Navigation: ({x:.2f}, {y:.2f})로 이동 중")
-            self.nav_status_label.setStyleSheet("color: blue; font-weight: bold;")
-            self.add_log(f"[Nav] 목표: x={x:.2f}, y={y:.2f}, yaw={yaw_deg}°")
-
-        except ValueError:
-            self.add_log("에러: 좌표 입력값이 잘못되었습니다")
-
-    def cancel_navigation(self):
-        """Navigation: 이동 취소"""
-        if not self.connected:
-            return
-
-        message = {
-            "command": "cancel_navigation",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-
-        self.nav_status_label.setText("Navigation: 취소됨")
-        self.nav_status_label.setStyleSheet("color: orange;")
-        self.add_log("[Nav] 이동 취소")
-
-    def start_qr_detection(self):
-        """QR 인식 시작"""
-        if not self.connected:
-            self.add_log("에러: 서버 연결 안됨")
-            return
-
-        message = {
-            "command": "qr_detect",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-
-        self.qr_active = True
-        self.btn_qr_start.setEnabled(False)
-        self.btn_qr_stop.setEnabled(True)
-        self.qr_status_label.setText("QR: 실행 중")
-        self.qr_status_label.setStyleSheet("color: green;")
-        self.add_log("QR 인식 시작")
-
-    def stop_qr_detection(self):
-        """QR 인식 중지"""
-        message = {
-            "command": "qr_stop",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-
-        self.qr_active = False
-        self.btn_qr_start.setEnabled(True)
-        self.btn_qr_stop.setEnabled(False)
-        self.qr_status_label.setText("QR: 대기 중")
-        self.qr_status_label.setStyleSheet("color: gray;")
-        self.add_log("QR 인식 중지")
-
-    def start_lidar_check(self):
-        """LiDAR 충돌 체크 시작"""
-        if not self.connected:
-            self.add_log("에러: 서버 연결 안됨")
-            return
-
-        message = {
-            "command": "lidar_check",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-
-        self.lidar_active = True
-        self.btn_lidar_start.setEnabled(False)
-        self.btn_lidar_stop.setEnabled(True)
-        self.lidar_status_label.setText("충돌 체크: 실행 중")
-        self.lidar_status_label.setStyleSheet("color: green;")
-        self.add_log("충돌 체크 시작")
-
-    def stop_lidar_check(self):
-        """LiDAR 충돌 체크 중지"""
-        message = {
-            "command": "lidar_stop",
-            "robot_id": self.selected_robot
-        }
-        self.ws_thread.send(message)
-
-        self.lidar_active = False
-        self.btn_lidar_start.setEnabled(True)
-        self.btn_lidar_stop.setEnabled(False)
-        self.lidar_status_label.setText("충돌 체크: 대기 중")
-        self.lidar_status_label.setStyleSheet("color: gray;")
-        self.add_log("충돌 체크 중지")
-
-    def update_camera_image(self, cv_image):
-        """카메라 영상 업데이트"""
-        rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-
-        scaled_pixmap = pixmap.scaled(
-            self.camera_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        )
-
-        self.camera_label.setPixmap(scaled_pixmap)
-
-    def on_message(self, msg):
-        """메시지 수신 처리"""
-        self.log.append(msg)
-
-        try:
-            data = json.loads(msg)
-            msg_type = data.get('type')
-
-            if msg_type == 'qr_detected':
-                qr_text = data.get('qr_text', '')
-                robot_id = data.get('robot_id', '')
-                self.add_log(f"[로봇{robot_id}] QR 인식: {qr_text}")
-                self.qr_status_label.setText(f"QR: 인식됨 [{qr_text}]")
-                self.qr_status_label.setStyleSheet("color: blue;")
-
-            elif msg_type == 'collision_warning':
-                robot_id = data.get('robot_id', '')
-                warning_msg = data.get('message', '')
-                self.add_log(f"[경고] [로봇{robot_id}] {warning_msg}")
-                self.lidar_status_label.setText("충돌 체크: 위험 감지!")
-                self.lidar_status_label.setStyleSheet("color: red;")
-
-            elif msg_type == 'nav_complete':
-                robot_id = data.get('robot_id', '')
-                self.add_log(f"[로봇{robot_id}] 목표 도착 완료!")
-                self.nav_status_label.setText("Navigation: 도착 완료")
-                self.nav_status_label.setStyleSheet("color: green; font-weight: bold;")
-
-            elif msg_type == 'nav_failed':
-                robot_id = data.get('robot_id', '')
-                reason = data.get('reason', 'unknown')
-                self.add_log(f"[로봇{robot_id}] 이동 실패: {reason}")
-                self.nav_status_label.setText(f"Navigation: 실패 ({reason})")
-                self.nav_status_label.setStyleSheet("color: red; font-weight: bold;")
-
-        except json.JSONDecodeError:
-            pass
-
-    def on_connection_changed(self, connected: bool):
-        """연결 상태 변경"""
-        self.connected = connected
-
-        if connected:
-            self.status_label.setText("서버 연결됨")
-            self.status_label.setStyleSheet("color: green; font-weight: bold;")
-            self.enable_controls(True)
+        if checked:
+            self.btn_manual_mode.setText('Manual Mode ON')
+            self.set_buttons_enabled(True)
+            if hasattr(self, 'btn_return_origin'): self.btn_return_origin.setEnabled(False)
+            if hasattr(self, 'btn_navigate'): self.btn_navigate.setEnabled(False)
+            self.setFocus()
         else:
-            self.status_label.setText("서버 연결 안됨")
-            self.status_label.setStyleSheet("color: red; font-weight: bold;")
-            self.enable_controls(False)
+            self.btn_manual_mode.setText('Auto Mode ON')
+            self.set_buttons_enabled(False)
+            if hasattr(self, 'btn_return_origin'): self.btn_return_origin.setEnabled(True)
+            if hasattr(self, 'btn_navigate'): self.btn_navigate.setEnabled(True)
 
-    def enable_controls(self, enabled: bool):
-        """제어 버튼 활성화/비활성화"""
+        self.set_stop_velocity()
+
+    def on_emergency_stop_toggled(self, checked):
+        self.emergency_stop_active = checked
+
+        if checked:
+            self.btn_emergency_stop.setText('Click to Release')
+            self.set_buttons_enabled(False)
+            self.btn_manual_mode.setEnabled(False)
+
+            if hasattr(self, 'btn_return_origin'): self.btn_return_origin.setEnabled(False)
+            if hasattr(self, 'btn_navigate'): self.btn_navigate.setEnabled(False)
+
+            if hasattr(self, 'label_status_display'):
+                self.label_status_display.setStyleSheet(
+                    "background-color: #444; padding: 5px; border-radius: 3px; color: red; font-weight: bold;"
+                )
+        else:
+            self.btn_emergency_stop.setText('Emergency Stop')
+            self.btn_manual_mode.setEnabled(True)
+            self.set_buttons_enabled(self.manual_mode_active)
+
+            if hasattr(self, 'btn_return_origin'):
+                self.btn_return_origin.setEnabled(not self.manual_mode_active)
+            if hasattr(self, 'btn_navigate'):
+                self.btn_navigate.setEnabled(not self.manual_mode_active)
+
+            if hasattr(self, 'label_status_display'):
+                self.label_status_display.setStyleSheet(
+                    "background-color: #444; padding: 5px; border-radius: 3px; color: white;"
+                )
+
+        self.set_stop_velocity()
+
+    def set_buttons_enabled(self, enabled):
         self.btn_forward.setEnabled(enabled)
         self.btn_backward.setEnabled(enabled)
         self.btn_left.setEnabled(enabled)
         self.btn_right.setEnabled(enabled)
         self.btn_stop.setEnabled(enabled)
 
-        self.btn_navigate.setEnabled(enabled)
-        self.btn_cancel_nav.setEnabled(enabled)
+    def set_velocity(self, linear_scale, angular):
+        if not self.manual_mode_active or self.emergency_stop_active:
+            return
+        self.target_linear_vel = linear_scale * self.max_linear_limit
+        self.target_angular_vel = angular
 
-        if enabled:
-            self.btn_qr_start.setEnabled(not self.qr_active)
-            self.btn_qr_stop.setEnabled(self.qr_active)
-            self.btn_lidar_start.setEnabled(not self.lidar_active)
-            self.btn_lidar_stop.setEnabled(self.lidar_active)
+    def set_stop_velocity(self):
+        self.target_linear_vel = 0.0
+        self.target_angular_vel = 0.0
+
+    def update_max_speed(self, value):
+        self.max_linear_limit = value / 100.0
+        if hasattr(self, 'label_max_speed_display'):
+            self.label_max_speed_display.setText(f"{self.max_linear_limit:.2f} m/s")
+
+    def update_loop(self):
+        # Send velocity
+        if self.connected and (self.manual_mode_active or self.emergency_stop_active):
+            linear = 0.0 if self.emergency_stop_active else self.target_linear_vel
+            angular = 0.0 if self.emergency_stop_active else self.target_angular_vel
+
+            self.ws_thread.send({
+                "command": "move",
+                "robot_id": self.current_robot_id,
+                "linear": float(linear),
+                "angular": float(angular)
+            })
+
+        self.update_gui_labels()
+
+    def update_gui_labels(self):
+        if hasattr(self, 'label_linear_vel'):
+            self.label_linear_vel.setText(f"Linear: {self.target_linear_vel:.2f} m/s")
+        if hasattr(self, 'label_angular_vel'):
+            self.label_angular_vel.setText(f"Angular: {self.target_angular_vel:.2f} rad/s")
+
+        if hasattr(self, 'label_status_display'):
+            dx = self.current_x - self.origin_offset_x
+            dy = self.current_y - self.origin_offset_y
+            self.label_status_display.setText(f"Pos: X: {dx:.2f} m | Y: {dy:.2f} m")
+
+        if hasattr(self, 'label_trip_info'):
+            elapsed = datetime.datetime.now() - self.start_time
+            elapsed_str = str(elapsed).split('.')[0]
+            self.label_trip_info.setText(f"Time {elapsed_str} | Dist {self.total_distance:.2f} m")
+
+        # Battery
+        if hasattr(self, 'label_battery'):
+            v = self.current_battery_voltage
+            if v > 0:
+                MAX_V, MIN_V = 12.6, 11.0
+                percentage = int((v - MIN_V) / (MAX_V - MIN_V) * 100)
+                percentage = max(0, min(100, percentage))
+                self.label_battery.setText(f"Battery: {percentage}% ({v:.1f}V)")
+
+                color = "green" if percentage > 70 else "orange" if percentage > 30 else "red"
+                self.label_battery.setStyleSheet(
+                    f"background-color: #222; color: {color}; font-weight: bold; "
+                    "border-radius: 10px; border: 1px solid #444; padding: 10px; font-size: 16pt;"
+                )
+            else:
+                self.label_battery.setText("Battery: Waiting...")
+
+        # Collision
+        if hasattr(self, 'label_collision_warning'):
+            if self.front_distance < 0.35:
+                self.label_collision_warning.setText("!!! COLLISION WARNING !!!")
+                self.label_collision_warning.setStyleSheet(
+                    "background-color: #ffcccc; border: 1px solid red; color: red; font-weight: bold; padding: 5px;"
+                )
+            elif self.front_distance < 1.0:
+                self.label_collision_warning.setText(f"Front Dist: {self.front_distance:.2f} m")
+                self.label_collision_warning.setStyleSheet(
+                    "background-color: #fff5cc; border: 1px solid orange; color: orange; font-weight: bold; padding: 5px;"
+                )
+            else:
+                self.label_collision_warning.setText("Front Clear")
+                self.label_collision_warning.setStyleSheet(
+                    "background-color: #2E8B57; color: white; padding: 5px;"
+                )
+
+    def update_camera_image(self, robot_id, cv_image):
+        """Updates camera image ONLY if robot_id matches selected robot"""
+
+        # CRITICAL FIX: Filter images by robot_id
+        if robot_id != self.current_robot_id:
+            return
+
+        import cv2
+        self.current_cv_frame = cv_image
+
+        if hasattr(self, 'label_camera_feed') and self.label_camera_feed.width() > 0:
+            rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+            scaled = pixmap.scaled(self.label_camera_feed.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.label_camera_feed.setPixmap(scaled)
+
+    def on_websocket_message(self, msg: dict):
+        msg_type = msg.get('type')
+        robot_id = msg.get('robot_id')
+
+        if robot_id and robot_id != self.current_robot_id:
+            return
+
+        if msg_type == 'position':
+            data = msg.get('position', {})
+            self.current_x = data.get('x', 0.0)
+            self.current_y = data.get('y', 0.0)
+            qz = data.get('qz', 0.0)
+            qw = data.get('qw', 1.0)
+            self.current_yaw = math.atan2(2.0 * qz * qw, 1.0 - 2.0 * qz * qz)
+
+            if self.prev_x is not None:
+                dx = self.current_x - self.prev_x
+                dy = self.current_y - self.prev_y
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist > 0.001:
+                    self.total_distance += dist
+            self.prev_x = self.current_x
+            self.prev_y = self.current_y
+
+        elif msg_type == 'scan':
+            ranges = msg.get('ranges', [])
+            if ranges:
+                self.front_distance = ranges[0] if ranges[0] > 0 else float('inf')
+
+        elif msg_type == 'battery':
+            self.current_battery_voltage = msg.get('voltage', 0.0)
+
+        elif msg_type == 'qr_detected':
+            qr_text = msg.get('qr_text', '')
+            if hasattr(self, 'qr_status_label'):
+                self.qr_status_label.setText(f"QR: {qr_text}")
+                self.qr_status_label.setStyleSheet("color: blue; font-weight: bold;")
+
+        elif msg_type == 'nav_feedback':
+            x = msg.get('x', 0.0)
+            y = msg.get('y', 0.0)
+            if hasattr(self, 'nav_status_label'):
+                self.nav_status_label.setText(f"Nav: Moving ({x:.1f}, {y:.1f})")
+                self.nav_status_label.setStyleSheet("color: yellow; font-weight: bold;")
+
+        elif msg_type == 'nav_complete':
+            self.is_navigating = False
+            if hasattr(self, 'nav_status_label'):
+                self.nav_status_label.setText("Nav: Reached!")
+                self.nav_status_label.setStyleSheet("color: green; font-weight: bold;")
+
+        elif msg_type == 'nav_failed':
+            reason = msg.get('reason', '')
+            self.is_navigating = False
+            if hasattr(self, 'nav_status_label'):
+                self.nav_status_label.setText(f"Nav: Failed ({reason})")
+                self.nav_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        elif msg_type == 'collision_warning':
+            print(f"[Warning] {msg.get('message', '')}")
+
+    def on_connection_changed(self, connected: bool):
+        self.connected = connected
+        if connected:
+            print("[Conn] Connected")
+            self.start_camera_stream()
+            if hasattr(self, 'statusbar'):
+                self.statusbar.showMessage("Connected", 3000)
         else:
-            self.btn_qr_start.setEnabled(False)
-            self.btn_qr_stop.setEnabled(False)
-            self.btn_lidar_start.setEnabled(False)
-            self.btn_lidar_stop.setEnabled(False)
+            print("[Conn] Disconnected")
+            if hasattr(self, 'statusbar'):
+                self.statusbar.showMessage("Disconnected", 5000)
 
-    def add_log(self, message: str):
-        """로그 추가"""
-        self.log.append(message)
-        scrollbar = self.log.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+    def on_set_origin_clicked(self):
+        self.origin_offset_x = self.current_x
+        self.origin_offset_y = self.current_y
+        if hasattr(self, 'label_status_display'):
+            self.label_status_display.setText("Status: Origin Reset (0, 0)")
+        if hasattr(self, 'statusbar'):
+            self.statusbar.showMessage("Origin Set", 2000)
+
+    def on_return_to_origin_clicked(self):
+        if not self.connected:
+            QMessageBox.warning(self, "Error", "Not connected!")
+            return
+        self.ws_thread.send({
+            "command": "navigate_to",
+            "robot_id": self.current_robot_id,
+            "x": self.origin_offset_x,
+            "y": self.origin_offset_y,
+            "yaw": 0.0
+        })
+        self.is_navigating = True
+        if hasattr(self, 'nav_status_label'):
+            self.nav_status_label.setText("Nav: Returning Home...")
+            self.nav_status_label.setStyleSheet("color: cyan; font-weight: bold;")
+
+    def on_navigate_clicked(self):
+        if not self.connected:
+            QMessageBox.warning(self, "Error", "Not connected!")
+            return
+        dialog = NavigationDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            coords = dialog.get_coordinates()
+            if coords:
+                x, y, yaw = coords
+                self.ws_thread.send({
+                    "command": "navigate_to",
+                    "robot_id": self.current_robot_id,
+                    "x": x,
+                    "y": y,
+                    "yaw": yaw
+                })
+                self.is_navigating = True
+                if hasattr(self, 'nav_status_label'):
+                    self.nav_status_label.setText(f"Nav: Moving to ({x:.1f}, {y:.1f})")
+                    self.nav_status_label.setStyleSheet("color: yellow; font-weight: bold;")
+            else:
+                QMessageBox.warning(self, "Error", "Invalid Input")
+
+    def on_cancel_nav_clicked(self):
+        if not self.connected: return
+        self.ws_thread.send({
+            "command": "cancel_navigation",
+            "robot_id": self.current_robot_id
+        })
+        self.is_navigating = False
+        if hasattr(self, 'nav_status_label'):
+            self.nav_status_label.setText("Nav: Canceled")
+            self.nav_status_label.setStyleSheet("color: orange;")
+
+    def on_qr_toggled(self, checked):
+        if not self.connected:
+            self.btn_qr_toggle.setChecked(False)
+            return
+        if checked:
+            self.ws_thread.send({"command": "qr_detect", "robot_id": self.current_robot_id})
+            self.qr_active = True
+            self.btn_qr_toggle.setText("Stop QR Scan")
+            if hasattr(self, 'qr_status_label'):
+                self.qr_status_label.setText("QR: Running")
+                self.qr_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.ws_thread.send({"command": "qr_stop", "robot_id": self.current_robot_id})
+            self.qr_active = False
+            self.btn_qr_toggle.setText("Start QR Scan")
+            if hasattr(self, 'qr_status_label'):
+                self.qr_status_label.setText("QR: OFF")
+                self.qr_status_label.setStyleSheet("color: gray;")
+
+    def on_lidar_toggled(self, checked):
+        if not self.connected:
+            self.btn_lidar_toggle.setChecked(False)
+            return
+        if checked:
+            self.ws_thread.send({"command": "lidar_check", "robot_id": self.current_robot_id})
+            self.lidar_active = True
+            self.btn_lidar_toggle.setText("Stop Collision Check")
+            if hasattr(self, 'lidar_status_label'):
+                self.lidar_status_label.setText("Collision: Running")
+                self.lidar_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.ws_thread.send({"command": "lidar_stop", "robot_id": self.current_robot_id})
+            self.lidar_active = False
+            self.btn_lidar_toggle.setText("Start Collision Check")
+            if hasattr(self, 'lidar_status_label'):
+                self.lidar_status_label.setText("Collision: OFF")
+                self.lidar_status_label.setStyleSheet("color: gray;")
+
+    def on_screenshot_clicked(self):
+        if self.current_cv_frame is not None:
+            import cv2
+            fname = f"capture_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            cv2.imwrite(fname, self.current_cv_frame)
+            if hasattr(self, 'statusbar'):
+                self.statusbar.showMessage(f"Saved: {fname}", 3000)
+        else:
+            QMessageBox.warning(self, "Error", "No Camera Feed")
+
+    def on_reset_trip(self):
+        self.total_distance = 0.0
+        self.start_time = datetime.datetime.now()
+        self.prev_x = self.current_x
+        self.prev_y = self.current_y
+        if hasattr(self, 'statusbar'):
+            self.statusbar.showMessage("Trip Reset", 2000)
+
+    def keyPressEvent(self, event):
+        if not self.manual_mode_active or self.emergency_stop_active: return
+        if event.isAutoRepeat(): return
+        key = event.key()
+        if key == Qt.Key_W:
+            self.set_velocity(1.0, 0.0)
+            self.btn_forward.setDown(True)
+        elif key == Qt.Key_S:
+            self.set_velocity(-1.0, 0.0)
+            self.btn_backward.setDown(True)
+        elif key == Qt.Key_A:
+            self.set_velocity(0.0, 0.8)
+            self.btn_left.setDown(True)
+        elif key == Qt.Key_D:
+            self.set_velocity(0.0, -0.8)
+            self.btn_right.setDown(True)
+        elif key in [Qt.Key_Space, Qt.Key_X]:
+            self.set_stop_velocity()
+            self.btn_stop.setDown(True)
+
+    def keyReleaseEvent(self, event):
+        if not self.manual_mode_active or self.emergency_stop_active: return
+        if event.isAutoRepeat(): return
+        self.set_stop_velocity()
+        self.btn_forward.setDown(False)
+        self.btn_backward.setDown(False)
+        self.btn_left.setDown(False)
+        self.btn_right.setDown(False)
+        self.btn_stop.setDown(False)
 
     def closeEvent(self, event):
-        """종료 처리"""
-        print("GUI 종료 중")
         if hasattr(self, 'ws_thread'):
             self.ws_thread.stop()
             self.ws_thread.wait(2000)
         event.accept()
-        print("종료 완료")
 
 def main():
-    """GUI 메인 함수"""
     app = QApplication(sys.argv)
-    window = TurtlebotGUI()
+    window = RobotControlWindow()
     window.show()
     sys.exit(app.exec_())
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("터틀봇 제어 GUI 시작 (Navigation + 카메라)")
-    print("=" * 60)
-    print(f"서버 주소: {SERVER_IP}:{SERVER_PORT}")
-    print("=" * 60)
+if __name__ == '__main__':
     main()
