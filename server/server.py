@@ -18,6 +18,11 @@ import traceback
 from server.ros_bridge import MultiRobotManager
 from shared.config import ROBOTS, ACTIVE_ROBOTS, SERVER_IP, SERVER_PORT
 
+# ==========================================
+# [설정] 디버그 모드 (True: 상세 로그 출력, False: 숨김)
+DEBUG = True
+# ==========================================
+
 # Optional Modules
 QR_AVAILABLE = False
 try:
@@ -141,6 +146,9 @@ async def handle_command(msg: dict) -> dict:
     command = msg.get('command')
     robot_id = msg.get('robot_id', 1)
 
+    if DEBUG:
+        print(f"[DEBUG-SERVER] WS Command received: {command} for Robot {robot_id}")
+
     if robot_id not in robot_manager.processes:
         return {"status": "error", "message": f"Robot {robot_id} not connected"}
 
@@ -175,11 +183,15 @@ async def handle_command(msg: dict) -> dict:
     elif command == 'qr_detect':
         if QR_AVAILABLE:
             qr_enabled[robot_id] = True
+            if DEBUG:
+                print(f"[DEBUG-SERVER] QR Detection ENABLED for Robot {robot_id}")
             return {"status": "ok", "message": "QR Started"}
         return {"status": "error", "message": "No QR Module"}
 
     elif command == 'qr_stop':
         qr_enabled[robot_id] = False
+        if DEBUG:
+            print(f"[DEBUG-SERVER] QR Detection DISABLED for Robot {robot_id}")
         return {"status": "ok", "message": "QR Stopped"}
 
     elif command == 'lidar_check':
@@ -248,21 +260,25 @@ async def handle_single_status(robot_id: int, status: dict):
                         print(f"[QR Action] Robot {robot_id}: {event_str}")
 
                         if event_str == "STOP":
+                            if DEBUG: print(f"[DEBUG-SERVER] Action: STOP triggered")
                             robot_manager.stop_robot(robot_id)
 
                         elif event_str == "CANCEL":
-                            robot_manager.cancel_navigation(robot_id)
+                            if DEBUG: print(f"[DEBUG-SERVER] Action: CANCEL NAV triggered")
+                            robot_manager.send_command(robot_id, {'command': 'cancel_navigation'})
 
                         elif event_str == "MARK":
+                            if DEBUG: print(f"[DEBUG-SERVER] Action: MARK ALIGNMENT triggered")
                             robot_manager.send_command(robot_id, {'command': 'start_mark_alignment'})
 
                         elif event_str.startswith("NAV_GOAL:"):
                             try:
                                 _, content = event_str.split(':', 1)
                                 _, x, y, yaw = content.split(',')
+                                if DEBUG: print(f"[DEBUG-SERVER] Action: NAV_GOAL to ({x}, {y}, {yaw})")
                                 robot_manager.navigate_to_pose(robot_id, float(x), float(y), float(yaw))
-                            except:
-                                print(f"[Error] Bad Nav Goal: {event_str}")
+                            except Exception as ex:
+                                print(f"[Error] Bad Nav Goal: {event_str} -> {ex}")
 
             except Exception as e:
                 pass
@@ -281,6 +297,8 @@ async def handle_single_status(robot_id: int, status: dict):
 
     # 3. Navigation Feedback & Result
     elif msg_type == 'nav_result':
+        if DEBUG:
+            print(f"[DEBUG-SERVER] Nav Result: {status}")
         await broadcast({
             "type": "nav_complete" if status.get('success') else "nav_failed",
             "robot_id": robot_id,
@@ -293,6 +311,8 @@ async def handle_single_status(robot_id: int, status: dict):
 
     elif msg_type == 'mark_complete':
         print(f"[Server] Robot {robot_id} Finished Marking")
+        if DEBUG:
+            print(f"[DEBUG-SERVER] Mark Complete Event")
         await broadcast({
             "type": "qr_detected",
             "robot_id": robot_id,

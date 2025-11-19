@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Twist, Quaternion
+from geometry_msgs.msg import Twist, Quaternion, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage
 from nav2_msgs.action import NavigateToPose
@@ -15,13 +15,18 @@ import subprocess
 import signal
 from cv_bridge import CvBridge
 from multiprocessing import Process, Queue
-from geometry_msgs.msg import PoseWithCovarianceStamped
+
+# ==========================================
+# [설정] 디버그 모드 & 상수
+DEBUG = True
+QR_LOST_TIMEOUT = 5.0  # QR 놓쳤을 때 포기하는 시간
+# ==========================================
 
 class TurtlebotBridge(Node):
     """
-    ROS2 Bridge Node
-    - Fix: Nav2 Env Variables
-    - Fix: QR Alignment Stability (Success Counter)
+    ROS2 Bridge Node (Merged Version)
+    - Yomi: Nav2 Env Fix, Auto-Init, Min Speed Kick
+    - Team: Debug Logs, Safety Timeout, Frame Skipping
     """
 
     def __init__(self, robot_id: int, domain_id: int,
@@ -37,6 +42,11 @@ class TurtlebotBridge(Node):
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.camera_sub = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, 10)
+
+        # [Yomi] Auto Init Pose Publisher
+        self.init_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self.create_timer(5.0, self.publish_initial_pose_once) # 5초 후 자동 원점 발사
+        self.initial_pose_sent = False
 
         # 2. Nav2 Client
         self.nav_action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -57,18 +67,26 @@ class TurtlebotBridge(Node):
         self.last_qr_angle = 0.0
         self.last_qr_width = 0.0
         self.latest_frame_width = 320
-        self.success_count = 0  # For stability check
 
-        # PID Gains
+        # [Team] Variables for Safety
+        self.last_qr_seen_time = 0.0
+        self.process_frame_count = 0
+        self.success_count = 0  # [Yomi] Stability check
+
+        # PID Gains (Yomi's Tuned Values)
         self.TARGET_QR_WIDTH = 120.0
-        self.K_CX = 0.002
-        self.K_ANG = 0.01
-        self.K_DIST = 0.002
+        self.K_CX = 0.0025
+        self.K_ANG = 0.015
+        self.K_DIST = 0.0025
 
-        # Thresholds
-        self.THRESH_CX = 15
-        self.THRESH_ANG = 5.0
+        # Thresholds (Yomi's Values - slightly looser for Min Speed Kick)
+        self.THRESH_CX = 20.0
+        self.THRESH_ANG = 3.0
         self.THRESH_DIST = 20.0
+
+        # Min Velocities (Yomi's Kick Logic)
+        self.MIN_LIN_VEL = 0.02
+        self.MIN_ANG_VEL = 0.15
 
         # Throttling
         self._last_cmd_time = 0.0
@@ -79,16 +97,17 @@ class TurtlebotBridge(Node):
         self.get_logger().info(f"Bridge Started: Robot {robot_id} (Domain {domain_id})")
 
     def start_navigation_server(self):
-        """Launch Nav2 Stack with correct Environment"""
+        """Launch Nav2 Stack with Correct Env (Yomi's Fix included)"""
         map_path = os.path.expanduser("~/maps/map.yaml")
         if not os.path.exists(map_path):
             self.get_logger().error(f"MAP FILE MISSING: {map_path}")
             return
 
-        # FIXED: Add TURTLEBOT3_MODEL env variable
+        # [Yomi] CRITICAL FIX: TURTLEBOT3_MODEL added
         env = os.environ.copy()
         env['ROS_DOMAIN_ID'] = str(self.domain_id)
-        env['TURTLEBOT3_MODEL'] = 'waffle_pi'  # CRITICAL FIX
+        env['TURTLEBOT3_MODEL'] = 'waffle_pi'
+        env['RCUTILS_COLORIZED_OUTPUT'] = '1'
 
         cmd = [
             'ros2', 'launch', 'turtlebot3_navigation2', 'navigation2.launch.py',
@@ -98,10 +117,18 @@ class TurtlebotBridge(Node):
         ]
 
         try:
+            # [Team] Debug Output Logic + [Yomi] Setsid
+            if DEBUG:
+                stdout_opt = None # Output to terminal
+                stderr_opt = None
+            else:
+                stdout_opt = subprocess.DEVNULL
+                stderr_opt = subprocess.PIPE
+
             self.nav_process = subprocess.Popen(
                 cmd, env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stdout=stdout_opt,
+                stderr=stderr_opt,
                 preexec_fn=os.setsid
             )
             self.get_logger().info(f"Nav2 Launched (PID: {self.nav_process.pid})")
@@ -114,17 +141,35 @@ class TurtlebotBridge(Node):
             self.execute_command(cmd)
 
         if self.mark_state == "ALIGNING":
-            self.process_alignment()
+            try:
+                self.process_alignment()
+            except Exception as e:
+                self.get_logger().error(f"[Control Loop Error] {e}")
+                self.mark_state = "IDLE"
 
     def process_alignment(self):
         if self.nav_busy: return
 
+        # [Team] Timeout Logic
+        if not hasattr(self, 'last_qr_seen_time'):
+             self.last_qr_seen_time = time.time()
+
+        time_since_lost = time.time() - self.last_qr_seen_time
+
         if not self.qr_visible or self.last_qr_center is None:
-            # Lost QR -> Rotate slowly
+            if time_since_lost > QR_LOST_TIMEOUT:
+                self.get_logger().warn(f"[MARK] Failed: QR Lost for {time_since_lost:.1f}s. Aborting.")
+                self.stop()
+                self.mark_state = "IDLE"
+                self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Mark Alignment Timeout'})
+                return
+
+            # Searching...
             self.success_count = 0
             self.move(0.0, 0.2)
             return
 
+        # Error Calculation
         cx, cy = self.last_qr_center
         angle = self.last_qr_angle
         width = self.last_qr_width
@@ -134,20 +179,21 @@ class TurtlebotBridge(Node):
         err_ang = angle
         err_dist = self.TARGET_QR_WIDTH - width
 
-        # Debug Log (Check this in terminal!)
-        # self.get_logger().info(f"Aligning... CX:{err_cx:.1f}, ANG:{err_ang:.1f}, DIST:{err_dist:.1f}")
+        # [Team] Debug Log
+        if DEBUG and (self.get_clock().now().nanoseconds % 500000000 < 100000000):
+             self.get_logger().info(f"[MARKING] ErrCx:{err_cx:.1f}, ErrAng:{err_ang:.1f}, ErrDist:{err_dist:.1f}")
 
-        # Check Success (Must be stable for 5 ticks)
+        # [Yomi] Stability Check (Must hold for 10 ticks)
         if abs(err_cx) < self.THRESH_CX and \
            abs(err_ang) < self.THRESH_ANG and \
            abs(err_dist) < self.THRESH_DIST:
 
             self.success_count += 1
-            if self.success_count > 5:
+            if self.success_count > 10:
                 self.stop()
                 self.mark_state = "DONE"
                 self.put_status({'type': 'mark_complete'})
-                self.get_logger().info("MARK ALIGNMENT SUCCESS!")
+                self.get_logger().info(f"[MARK SUCCESS] Final Error -> Cx:{err_cx:.2f}, Ang:{err_ang:.2f}, Dist:{err_dist:.2f}")
                 self.mark_state = "IDLE"
                 return
         else:
@@ -157,14 +203,28 @@ class TurtlebotBridge(Node):
         ang_spd = -(self.K_CX * err_cx) - (self.K_ANG * err_ang)
         lin_spd = self.K_DIST * err_dist
 
-        # Clamp
+        # [Yomi] Min Speed Kick (Deadzone Compensation)
+        if abs(lin_spd) < self.MIN_LIN_VEL:
+            if abs(err_dist) > self.THRESH_DIST:
+                lin_spd = self.MIN_LIN_VEL * np.sign(lin_spd)
+            else:
+                lin_spd = 0.0
+
+        if abs(ang_spd) < self.MIN_ANG_VEL:
+            if abs(err_cx) > self.THRESH_CX or abs(err_ang) > self.THRESH_ANG:
+                ang_spd = self.MIN_ANG_VEL * np.sign(ang_spd)
+            else:
+                ang_spd = 0.0
+
+        # Max Limit
         lin_spd = np.clip(lin_spd, -0.08, 0.08)
-        ang_spd = np.clip(ang_spd, -0.4, 0.4)
+        ang_spd = np.clip(ang_spd, -0.5, 0.5)
 
         self.move(lin_spd, ang_spd)
 
     def execute_command(self, cmd: dict):
         c_type = cmd.get('command')
+        if DEBUG: self.get_logger().info(f"[Bridge] Executing: {c_type}")
 
         if c_type == 'move':
             if not self.nav_busy and self.mark_state == "IDLE":
@@ -184,6 +244,8 @@ class TurtlebotBridge(Node):
 
         elif c_type == 'start_mark_alignment':
             self.get_logger().info("Starting MARK Alignment")
+            self.qr_visible = False
+            self.last_qr_seen_time = time.time()
             self.mark_state = "ALIGNING"
             self.success_count = 0
 
@@ -196,7 +258,6 @@ class TurtlebotBridge(Node):
         if abs(msg.linear.x - self.prev_linear) > 0.001 or \
            abs(msg.angular.z - self.prev_angular) > 0.001 or \
            (now - self._last_cmd_time) > 0.1:
-
             self.cmd_vel_pub.publish(msg)
             self.prev_linear = msg.linear.x
             self.prev_angular = msg.angular.z
@@ -209,6 +270,11 @@ class TurtlebotBridge(Node):
         self.put_status({'type': 'camera', 'data': {'data': bytes(msg.data)}})
 
         if self.mark_state == "ALIGNING":
+            self.process_frame_count += 1
+            # [Team] Frame Skipping (Process every 3rd frame)
+            if self.process_frame_count % 3 != 0:
+                return
+
             try:
                 np_arr = np.frombuffer(msg.data, np.uint8)
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -220,6 +286,7 @@ class TurtlebotBridge(Node):
                 if points is not None:
                     self.qr_visible = True
                     pts = points.reshape(-1, 2)
+
                     cx = np.mean(pts[:, 0])
                     cy = np.mean(pts[:, 1])
 
@@ -229,21 +296,19 @@ class TurtlebotBridge(Node):
 
                     w1 = np.linalg.norm(pts[0] - pts[1])
                     w2 = np.linalg.norm(pts[2] - pts[3])
-                    width = (w1 + w2) / 2.0
 
                     self.last_qr_center = (cx, cy)
                     self.last_qr_angle = angle
-                    self.last_qr_width = width
+                    self.last_qr_width = (w1 + w2) / 2.0
+                    self.last_qr_seen_time = time.time() # Update seen time
                 else:
                     self.qr_visible = False
-            except: pass
+            except Exception as e:
+                if DEBUG: self.get_logger().error(f"[Camera Error] {e}")
 
     def send_nav_goal(self, x, y, yaw):
         if self.nav_busy: return
-
-        # Wait longer for server (up to 10s)
         if not self.nav_action_client.wait_for_server(timeout_sec=10.0):
-            self.get_logger().error("Nav2 Action Server Not Ready (Check Logs)")
             self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Nav2 Not Ready'})
             return
 
@@ -256,6 +321,7 @@ class TurtlebotBridge(Node):
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.nav_busy = True
+        if DEBUG: self.get_logger().info(f"[Bridge] Sending Nav Goal: {x}, {y}")
         future = self.nav_action_client.send_goal_async(goal)
         future.add_done_callback(self.goal_response_callback)
 
@@ -290,32 +356,22 @@ class TurtlebotBridge(Node):
             self.status_queue.put_nowait(data)
         except: pass
 
-    def __del__(self):
-        if self.nav_process:
-            os.killpg(os.getpgid(self.nav_process.pid), signal.SIGTERM)
-
-        self.init_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
-
-        # (Nav2가 켜지는 시간을 벌어주는 거예요)
-        self.create_timer(5.0, self.publish_initial_pose_once)
-        self.initial_pose_sent = False
-
+    # [Yomi] Auto-Init Pose Logic
     def publish_initial_pose_once(self):
-        if self.initial_pose_sent:
-            return
-
+        if self.initial_pose_sent: return
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
-
-        # 원점 (0, 0) 설정
         msg.pose.pose.position.x = 0.0
         msg.pose.pose.position.y = 0.0
-        msg.pose.pose.orientation.w = 1.0  # 방향은 정면
-
+        msg.pose.pose.orientation.w = 1.0
         self.init_pose_pub.publish(msg)
-        self.get_logger().info(f"📍 [Auto-Init] 로봇 {self.robot_id} 초기 위치(0,0) 전송 완료!")
+        self.get_logger().info(f"📍 [Auto-Init] Robot {self.robot_id} Pose Set to (0,0)")
         self.initial_pose_sent = True
+
+    def __del__(self):
+        if self.nav_process:
+            os.killpg(os.getpgid(self.nav_process.pid), signal.SIGTERM)
 
 def run_bridge_process(rid, did, cmd_q, stat_q):
     os.environ['ROS_DOMAIN_ID'] = str(did)
@@ -328,6 +384,7 @@ def run_bridge_process(rid, did, cmd_q, stat_q):
         rclpy.shutdown()
 
 class MultiRobotManager:
+    # (변경 사항 없음, 기존과 동일)
     def __init__(self):
         self.processes = {}
         self.cmd_qs = {}
