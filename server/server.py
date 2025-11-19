@@ -2,7 +2,7 @@
 FastAPI Server + Multi-Robot Control + Navigation2
 - Integrated logic for QR events
 - Server-side processing emphasis
-- NO EMOJIS
+- Config fix: ACTIVE_ROBOTS support
 """
 
 import json
@@ -16,7 +16,7 @@ import uvicorn
 import traceback
 
 from server.ros_bridge import MultiRobotManager
-from shared.config import ROBOTS, SERVER_IP, SERVER_PORT
+from shared.config import ROBOTS, ACTIVE_ROBOTS, SERVER_IP, SERVER_PORT
 
 # Optional Modules
 QR_AVAILABLE = False
@@ -35,7 +35,7 @@ try:
 except Exception as e:
     print(f"[WARN] LiDAR Module Failed: {e}")
 
-app = FastAPI(title="Turtlebot Control Server", version="3.0")
+app = FastAPI(title="Turtlebot Control Server", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,15 +81,20 @@ async def startup_event():
     print("SERVER STARTUP")
     print("=" * 60)
 
-    # 1. Connect Robots
-    print("[1] Connecting to Robots...")
-    for robot_id, info in ROBOTS.items():
-        print(f"    Target: {info['name']} (ID:{robot_id}, Domain:{info['domain_id']})")
-        robot_manager.add_robot(robot_id, info['domain_id'])
+    # 1. Connect Robots (FIXED: Using ACTIVE_ROBOTS)
+    print(f"[1] Connecting to Active Robots: {ACTIVE_ROBOTS}")
 
-        # Init Flags
-        qr_enabled[robot_id] = False
-        lidar_enabled[robot_id] = False
+    for robot_id in ACTIVE_ROBOTS:
+        if robot_id in ROBOTS:
+            info = ROBOTS[robot_id]
+            print(f"    Connecting -> {info['name']} (ID:{robot_id}, Domain:{info['domain_id']})")
+            robot_manager.add_robot(robot_id, info['domain_id'])
+
+            # Init Flags
+            qr_enabled[robot_id] = False
+            lidar_enabled[robot_id] = False
+        else:
+            print(f"[WARN] Robot ID {robot_id} defined in ACTIVE_ROBOTS but not in ROBOTS config.")
 
     # 2. Start Background Loop
     print("[2] Starting Background Task...")
@@ -100,8 +105,9 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     print("SERVER SHUTDOWN")
-    for robot_id in ROBOTS.keys():
-        robot_manager.stop_robot(robot_id)
+    for robot_id in ACTIVE_ROBOTS:
+        if robot_id in ROBOTS:
+            robot_manager.stop_robot(robot_id)
     robot_manager.shutdown()
 
 # --- WebSocket Handler ---
@@ -187,7 +193,6 @@ async def handle_command(msg: dict) -> dict:
         return {"status": "ok", "message": "LiDAR Stopped"}
 
     elif command == 'camera_start':
-        # Just a placeholder, camera is always streaming if robot is connected
         return {"status": "ok"}
 
     return {"status": "error", "message": "Unknown Command"}
@@ -214,11 +219,7 @@ async def handle_single_status(robot_id: int, status: dict):
 
     # 1. Camera & QR Logic
     if msg_type == 'camera':
-        # A. Always broadcast image to GUI
         if data:
-            # Convert raw bytes to hex for JSON
-            # NOTE: For performance, in production we might use binary websocket
-            # but here we stick to JSON for compatibility with existing GUI
             try:
                 np_arr = np.frombuffer(data['data'], np.uint8)
                 image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -232,7 +233,7 @@ async def handle_single_status(robot_id: int, status: dict):
                     "image_data": img_hex
                 })
 
-                # B. QR Processing (if enabled)
+                # QR Processing
                 if qr_enabled.get(robot_id, False) and QR_AVAILABLE:
                     event_str = qr_module.process_image(image, time.time(), robot_id)
 
@@ -244,7 +245,6 @@ async def handle_single_status(robot_id: int, status: dict):
                             "qr_text": event_str
                         })
 
-                        # LOGIC: Translate Event -> Action
                         print(f"[QR Action] Robot {robot_id}: {event_str}")
 
                         if event_str == "STOP":
@@ -254,11 +254,9 @@ async def handle_single_status(robot_id: int, status: dict):
                             robot_manager.cancel_navigation(robot_id)
 
                         elif event_str == "MARK":
-                            # Start Visual Servoing
                             robot_manager.send_command(robot_id, {'command': 'start_mark_alignment'})
 
                         elif event_str.startswith("NAV_GOAL:"):
-                            # NAV_GOAL:name,x,y,yaw
                             try:
                                 _, content = event_str.split(':', 1)
                                 _, x, y, yaw = content.split(',')
@@ -267,7 +265,7 @@ async def handle_single_status(robot_id: int, status: dict):
                                 print(f"[Error] Bad Nav Goal: {event_str}")
 
             except Exception as e:
-                print(f"[Camera Error] {e}")
+                pass
 
     # 2. LiDAR Logic
     elif msg_type == 'scan':
@@ -284,12 +282,17 @@ async def handle_single_status(robot_id: int, status: dict):
     # 3. Navigation Feedback & Result
     elif msg_type == 'nav_result':
         await broadcast({
-            "type": "nav_failed" if not status.get('success') else "nav_complete",
+            "type": "nav_complete" if status.get('success') else "nav_failed",
             "robot_id": robot_id,
             "reason": status.get('reason')
         })
 
+    elif msg_type == 'nav_status':
+         # Extra feedback handling if needed
+         pass
+
     elif msg_type == 'mark_complete':
+        print(f"[Server] Robot {robot_id} Finished Marking")
         await broadcast({
             "type": "qr_detected",
             "robot_id": robot_id,

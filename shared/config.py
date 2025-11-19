@@ -28,7 +28,7 @@ ROBOTS = {
 }
 
 # 환경변수로 사용할 로봇 제한 (예: "1,3" 또는 "1")
-ACTIVE_ROBOTS_ENV = os.getenv("ACTIVE_ROBOTS", "1, 2, 3")
+ACTIVE_ROBOTS_ENV = os.getenv("ACTIVE_ROBOTS", "1, 3")
 
 # 활성화할 로봇 ID 리스트
 ACTIVE_ROBOTS = [int(rid.strip()) for rid in ACTIVE_ROBOTS_ENV.split(",") if rid.strip().isdigit()]
@@ -36,5 +36,5 @@ ACTIVE_ROBOTS = [int(rid.strip()) for rid in ACTIVE_ROBOTS_ENV.split(",") if rid
 print(f"[Config] 활성 로봇: {ACTIVE_ROBOTS}")
 
 # 속도 제한 (안전장치)
-MAX_LINEAR_SPEED = 0.22
-MAX_ANGULAR_SPEED = 2.84
+MAX_LINEAR_SPEED = 0.05
+MAX_ANGULAR_SPEED = 2.85
