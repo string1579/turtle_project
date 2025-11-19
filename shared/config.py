@@ -5,7 +5,7 @@
 import os
 
 # 서버 설정
-SERVER_IP = "192.168.30.5"
+SERVER_IP = "192.168.30.3"
 SERVER_PORT = 8080
 
 # 터틀봇 정보
@@ -28,7 +28,7 @@ ROBOTS = {
 }
 
 # 환경변수로 사용할 로봇 제한 (예: "1,3" 또는 "1")
-ACTIVE_ROBOTS_ENV = os.getenv("ACTIVE_ROBOTS", "1, 2, 3")
+ACTIVE_ROBOTS_ENV = os.getenv("ACTIVE_ROBOTS", "2")
 
 # 활성화할 로봇 ID 리스트
 ACTIVE_ROBOTS = [int(rid.strip()) for rid in ACTIVE_ROBOTS_ENV.split(",") if rid.strip().isdigit()]

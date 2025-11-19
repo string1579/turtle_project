@@ -16,6 +16,11 @@ import signal
 from cv_bridge import CvBridge
 from multiprocessing import Process, Queue
 
+# ==========================================
+# [설정] 디버그 모드 (True: 상세 로그 출력, False: 숨김)
+DEBUG = True
+# ==========================================
+
 class TurtlebotBridge(Node):
     """
     ROS2 Bridge Node
@@ -99,7 +104,14 @@ class TurtlebotBridge(Node):
         ]
 
         try:
-            # [수정] stdout=None, stderr=None으로 바꾸면 터미널에 Nav2 로그가 콸콸 쏟아집니다!
+            # [수정] DEBUG 모드일 때 Nav2 로그도 터미널에 표시, 아니면 숨김
+            if DEBUG:
+                stdout_opt = None
+                stderr_opt = None
+            else:
+                stdout=None,  # 기존: subprocess.DEVNULL
+                stderr=None,  # 기존: subprocess.PIPE
+
             self.nav_process = subprocess.Popen(
                 cmd, env=env,
                 stdout=None,  # 기존: subprocess.DEVNULL
@@ -137,6 +149,9 @@ class TurtlebotBridge(Node):
         err_ang = angle
         err_dist = self.TARGET_QR_WIDTH - width
 
+        if DEBUG and (self.get_clock().now().nanoseconds % 1000000000 < 100000000): # 1초에 한 번 정도만 로그
+             self.get_logger().info(f"[MARK] Errors - Cx:{err_cx:.1f}, Ang:{err_ang:.1f}, Dist:{err_dist:.1f}")
+
         # Check Success
         if abs(err_cx) < self.THRESH_CX and \
            abs(err_ang) < self.THRESH_ANG and \
@@ -168,6 +183,9 @@ class TurtlebotBridge(Node):
     def execute_command(self, cmd: dict):
         c_type = cmd.get('command')
 
+        if DEBUG:
+            self.get_logger().info(f"[Bridge] Executing Command: {c_type} -> {cmd}")
+
         if c_type == 'move':
             if not self.nav_busy and self.mark_state == "IDLE":
                 self.move(cmd.get('linear'), cmd.get('angular'))
@@ -197,6 +215,9 @@ class TurtlebotBridge(Node):
         if abs(msg.linear.x - self.prev_linear) > 0.001 or \
            abs(msg.angular.z - self.prev_angular) > 0.001 or \
            (now - self._last_cmd_time) > 0.1:
+
+            if DEBUG:
+                self.get_logger().info(f"[Bridge] Pub CmdVel: lin={msg.linear.x:.2f}, ang={msg.angular.z:.2f}")
 
             self.cmd_vel_pub.publish(msg)
             self.prev_linear = msg.linear.x
@@ -266,15 +287,23 @@ class TurtlebotBridge(Node):
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.nav_busy = True
+
+        if DEBUG:
+            self.get_logger().info(f"[Bridge] Sending Nav2 Goal: x={x}, y={y}, yaw={yaw}")
+
         future = self.nav_action_client.send_goal_async(goal)
         future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
         handle = future.result()
         if not handle.accepted:
+            self.get_logger().error("[Bridge] Nav2 Goal REJECTED")
             self.nav_busy = False
             self.put_status({'type': 'nav_result', 'success': False, 'reason': 'Rejected'})
             return
+
+        if DEBUG:
+            self.get_logger().info("[Bridge] Nav2 Goal ACCEPTED")
 
         self._goal_handle = handle
         res_future = handle.get_result_async()
@@ -284,11 +313,17 @@ class TurtlebotBridge(Node):
         status = future.result().status
         self.nav_busy = False
         self._goal_handle = None
+
+        if DEBUG:
+            self.get_logger().info(f"[Bridge] Nav2 Goal Finished with Status: {status}")
+
         # Status 4 is Succeeded
         self.put_status({'type': 'nav_result', 'success': (status == 4), 'reason': str(status)})
 
     def cancel_navigation(self):
         if self._goal_handle:
+            if DEBUG:
+                self.get_logger().info("[Bridge] Canceling Navigation Goal")
             self._goal_handle.cancel_goal_async()
 
     def odom_callback(self, msg):
