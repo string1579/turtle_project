@@ -72,7 +72,7 @@ class SimpleRobotController(Node):
         # QR 관련
         self.qr_detector = cv2.QRCodeDetector()
 
-        # Mark 정밀 제어 관련
+        # Mark 정밀 제어 관련 (Team E 담당 변수)
         self.mark_aligning = False
         self.last_qr_center = None
         self.last_qr_width = 0
@@ -202,6 +202,7 @@ class SimpleRobotController(Node):
             'ranges': list(msg.ranges[::10])  # 10개마다 1개씩만
         })
 
+    # ========== [팀원E 담당 시작] ==========
     def camera_callback(self, msg):
         """카메라 & QR 처리"""
         try:
@@ -240,6 +241,17 @@ class SimpleRobotController(Node):
                         'qr_text': data
                     })
 
+                else:
+                    # [안전 기능 추가] QR이 시야에서 사라지면 정보 초기화
+                    self.last_qr_center = None
+                    self.last_qr_width = 0
+
+                    # 정렬 중 QR을 놓치면 즉시 정지 (폭주 방지)
+                    if self.mark_aligning:
+                        print("[QR] MARK 놓침 - 정지 및 정렬 해제")
+                        self.stop()
+                        self.mark_aligning = False
+
             # 이미지 전송 (GUI 표시용)
             _, buffer = cv2.imencode('.jpg', cv_image,
                                     [cv2.IMWRITE_JPEG_QUALITY, 50])
@@ -252,17 +264,6 @@ class SimpleRobotController(Node):
 
         except Exception as e:
             self.get_logger().error(f"Camera error: {e}")
-
-    def battery_callback(self, msg):
-        """배터리 상태"""
-        state = self.robot_states[self.current_robot]
-        state['battery'] = msg.voltage
-
-        self.broadcast({
-            'type': 'battery',
-            'robot_id': self.current_robot,
-            'voltage': msg.voltage
-        })
 
     def handle_qr_command(self, data):
         """QR 명령 처리"""
@@ -291,6 +292,7 @@ class SimpleRobotController(Node):
                     print(f"[QR] 목표 이동: ({x}, {y})")
             except:
                 pass
+    # ========== [팀원E 담당 끝] ==========
 
     def navigate_to(self, x, y, yaw=0.0):
         """Navigation2 목표 이동"""
