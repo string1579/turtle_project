@@ -2,6 +2,7 @@
 """
 Simple Turtlebot Server - Final Version (Team A Updated)
 - LiDAR 박스 필터링(직사각형 감지) 적용
+- 감지 폭 축소 (0.25 -> 0.12)
 - QoS 설정 완료
 - 스레드 안전성 확보
 """
@@ -157,12 +158,12 @@ class SimpleRobotController(Node):
     def scan_callback(self, msg):
         """
         [수정됨] 직사각형(Box) 필터링 적용
-        전방 80cm, 좌우 폭 50cm(중심 25cm) 이내 장애물만 감지
+        전방 80cm, 좌우 폭 24cm(중심 12cm) 이내 장애물만 감지
         """
         if not msg.ranges: return
 
-        # 설정값
-        ROBOT_WIDTH_MARGIN = 0.25  # 로봇 중심에서 좌우 25cm (전체 폭 50cm)
+        # [수정] 설정값 변경 (0.25 -> 0.12)
+        ROBOT_WIDTH_MARGIN = 0.12  # 로봇 중심에서 좌우 12cm (전체 폭 24cm)
         LOOKAHEAD_DIST = 0.8       # 전방 감지 거리 80cm
 
         min_dist_in_path = 99.9    # 기본값 (장애물 없음)
@@ -172,7 +173,6 @@ class SimpleRobotController(Node):
         angle_increment = msg.angle_increment
 
         # 계산 효율을 위해 전방 90도(좌우 45도) 범위만 루프
-        # 터틀봇3 기준: 인덱스 0이 정면
         indices_to_check = list(range(0, 45)) + list(range(max(0, num_ranges - 45), num_ranges))
 
         for i in indices_to_check:
@@ -184,18 +184,16 @@ class SimpleRobotController(Node):
                 continue
 
             # 각도 계산 (Radian)
-            # 0 ~ 180도 인덱스: 좌측(+), 그 외: 우측(-)
             if i < num_ranges / 2:
                 angle = i * angle_increment
             else:
                 angle = (i - num_ranges) * angle_increment
 
             # 좌표 변환 (Polar -> Cartesian)
-            # x: 전방 거리, y: 좌우 거리
             x = r * math.cos(angle)
             y = r * math.sin(angle)
 
-            # [핵심] 박스 필터링: 내 진행 경로(직사각형) 안에 있는 점인가?
+            # [핵심] 박스 필터링
             if 0 < x < LOOKAHEAD_DIST and abs(y) < ROBOT_WIDTH_MARGIN:
                 if x < min_dist_in_path:
                     min_dist_in_path = x
@@ -204,12 +202,12 @@ class SimpleRobotController(Node):
         state = self.robot_states[self.current_robot]
         state['front_distance'] = min_dist_in_path
 
-        # 충돌 방지 로직 (LiDAR 기능 켜져 있을 때만)
+        # 충돌 방지 로직
         if state['lidar_enabled'] and min_dist_in_path < 0.35 and state['mode'] != 'emergency':
             self.stop()
             self.broadcast({'type': 'collision_warning', 'robot_id': self.current_robot, 'message': f'경로상 장애물: {min_dist_in_path:.2f}m'})
 
-        # GUI 전송 (데이터 절약)
+        # GUI 전송
         self.broadcast({
             'type': 'scan',
             'robot_id': self.current_robot,
@@ -252,7 +250,6 @@ class SimpleRobotController(Node):
             })
 
         except Exception as e:
-            # print(f"[Camera Error] {e}")
             pass
 
     def handle_qr_command(self, data):
@@ -287,8 +284,7 @@ class SimpleRobotController(Node):
         state = self.robot_states[self.current_robot]
         if state['emergency']: return
 
-        # [수정] 박스 필터링된 거리값 사용
-        # 전진하려고 할 때(linear > 0), 경로상에 장애물이 있으면(0.3m 이내) 정지
+        # 전진 시에만 장애물 체크
         if linear > 0 and state['front_distance'] < 0.3:
             linear = 0.0
 
