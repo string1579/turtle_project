@@ -18,7 +18,7 @@ import os
 # ROS Domain ID 설정
 # ==========================================
 # 개별 테스트 시에는 '3'으로, 전체 통합 시에는 '5'로 설정하세요.
-os.environ['ROS_DOMAIN_ID'] = '17'
+os.environ['ROS_DOMAIN_ID'] = '5'
 
 import rclpy
 from rclpy.node import Node
