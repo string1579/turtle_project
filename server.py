@@ -519,7 +519,7 @@ async def handle_command(msg: dict):
 
     elif cmd == 'qr_stop':
         ros_node.robot_states[robot_id]['qr_enabled'] = False
-        ros_node.mark_aligning = False
+        ros_node.mark_aligning = Falsehg
         print("[QR] 비활성화")
 
     elif cmd == 'lidar_check':
