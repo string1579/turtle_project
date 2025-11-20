@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Simple Turtlebot Server - Final Stable Version
-수정: 팀원 A, B, D, E 통합 (스레드 안전성 확보)
+Simple Turtlebot Server - Final Version (Team A Updated)
+- LiDAR 박스 필터링(직사각형 감지) 적용
+- QoS 설정 완료
+- 스레드 안전성 확보
 """
 
 import asyncio
@@ -45,13 +47,13 @@ SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8080
 
 # ==========================================
-# ROS2 노드 (통합 수정됨)
+# ROS2 노드
 # ==========================================
 class SimpleRobotController(Node):
     def __init__(self, loop):
         super().__init__('simple_controller')
 
-        # [핵심 수정] 메인 이벤트 루프 저장 (스레드 간 통신용)
+        # 메인 이벤트 루프 저장
         self.app_loop = loop
 
         print(f"[ROS] Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
@@ -84,7 +86,7 @@ class SimpleRobotController(Node):
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self.init_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
-        # QoS 설정
+        # QoS 설정 (카메라용)
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         # Subscribers
@@ -99,27 +101,20 @@ class SimpleRobotController(Node):
 
         self.get_logger().info("Simple Controller Ready!")
 
-    # [팀원 A, B 핵심 수정] 스레드 안전한 브로드캐스트
     def broadcast(self, message):
         """ROS 스레드에서 FastAPI 루프로 안전하게 메시지 전송"""
         if not self.websocket_clients:
             return
 
         json_msg = json.dumps(message)
-
-        # 죽은 클라이언트 정리를 위한 리스트
         dead_clients = []
 
         for client in self.websocket_clients:
             try:
-                # [핵심] run_coroutine_threadsafe 사용
-                # ROS 스레드에서 메인 루프(app_loop)에 작업을 예약함
                 asyncio.run_coroutine_threadsafe(client.send_text(json_msg), self.app_loop)
             except Exception as e:
-                print(f"[Broadcast Error] {e}")
                 dead_clients.append(client)
 
-        # 연결 끊긴 클라이언트 정리
         for dc in dead_clients:
             if dc in self.websocket_clients:
                 self.websocket_clients.remove(dc)
@@ -137,7 +132,6 @@ class SimpleRobotController(Node):
         if abs(error_x) < 20 and abs(error_size) < 20:
             self.stop()
             self.mark_aligning = False
-            print("[MARK] 정밀 정렬 완료!")
             self.broadcast({'type': 'qr_detected', 'robot_id': self.current_robot, 'qr_text': 'MARK - 정렬 완료'})
             return
 
@@ -161,40 +155,73 @@ class SimpleRobotController(Node):
         })
 
     def scan_callback(self, msg):
+        """
+        [수정됨] 직사각형(Box) 필터링 적용
+        전방 80cm, 좌우 폭 50cm(중심 25cm) 이내 장애물만 감지
+        """
         if not msg.ranges: return
 
+        # 설정값
+        ROBOT_WIDTH_MARGIN = 0.25  # 로봇 중심에서 좌우 25cm (전체 폭 50cm)
+        LOOKAHEAD_DIST = 0.8       # 전방 감지 거리 80cm
+
+        min_dist_in_path = 99.9    # 기본값 (장애물 없음)
+
+        ranges = msg.ranges
+        num_ranges = len(ranges)
+        angle_increment = msg.angle_increment
+
+        # 계산 효율을 위해 전방 90도(좌우 45도) 범위만 루프
+        # 터틀봇3 기준: 인덱스 0이 정면
+        indices_to_check = list(range(0, 45)) + list(range(max(0, num_ranges - 45), num_ranges))
+
+        for i in indices_to_check:
+            if i >= num_ranges: continue
+            r = ranges[i]
+
+            # 유효하지 않은 거리값 제외
+            if r < 0.05 or r > LOOKAHEAD_DIST:
+                continue
+
+            # 각도 계산 (Radian)
+            # 0 ~ 180도 인덱스: 좌측(+), 그 외: 우측(-)
+            if i < num_ranges / 2:
+                angle = i * angle_increment
+            else:
+                angle = (i - num_ranges) * angle_increment
+
+            # 좌표 변환 (Polar -> Cartesian)
+            # x: 전방 거리, y: 좌우 거리
+            x = r * math.cos(angle)
+            y = r * math.sin(angle)
+
+            # [핵심] 박스 필터링: 내 진행 경로(직사각형) 안에 있는 점인가?
+            if 0 < x < LOOKAHEAD_DIST and abs(y) < ROBOT_WIDTH_MARGIN:
+                if x < min_dist_in_path:
+                    min_dist_in_path = x
+
+        # 상태 업데이트
         state = self.robot_states[self.current_robot]
-        # 전방 데이터 필터링
-        num_readings = len(msg.ranges)
-        right = msg.ranges[0:min(30, num_readings)]
-        left = msg.ranges[max(0, num_readings - 30):num_readings]
-        front = list(right) + list(left)
-        valid = [r for r in front if not math.isnan(r) and not math.isinf(r) and 0.1 < r < 10.0]
+        state['front_distance'] = min_dist_in_path
 
-        if valid:
-            min_dist = min(valid)
-            state['front_distance'] = min_dist
+        # 충돌 방지 로직 (LiDAR 기능 켜져 있을 때만)
+        if state['lidar_enabled'] and min_dist_in_path < 0.35 and state['mode'] != 'emergency':
+            self.stop()
+            self.broadcast({'type': 'collision_warning', 'robot_id': self.current_robot, 'message': f'경로상 장애물: {min_dist_in_path:.2f}m'})
 
-            if state['lidar_enabled'] and min_dist < 0.35 and state['mode'] != 'emergency':
-                self.stop()
-                self.broadcast({'type': 'collision_warning', 'robot_id': self.current_robot, 'message': f'장애물: {min_dist:.2f}m'})
-        else:
-            state['front_distance'] = 999.0
-
+        # GUI 전송 (데이터 절약)
         self.broadcast({
             'type': 'scan',
             'robot_id': self.current_robot,
-            'ranges': list(msg.ranges[::10])
+            'ranges': [min_dist_in_path] if min_dist_in_path < 99.0 else []
         })
 
     def camera_callback(self, msg):
-        """카메라 처리 (정석 방법 적용)"""
         try:
             np_arr = np.frombuffer(msg.data, np.uint8)
             cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if cv_image is None: return
 
-            # QR 처리
             state = self.robot_states[self.current_robot]
             if state['qr_enabled']:
                 gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
@@ -214,16 +241,9 @@ class SimpleRobotController(Node):
                         self.stop()
                         self.mark_aligning = False
 
-            # 이미지 전송 (broadcast 사용 - 이제 안전함!)
+            # 이미지 전송
             _, buffer = cv2.imencode('.jpg', cv_image, [cv2.IMWRITE_JPEG_QUALITY, 50])
             image_hex = buffer.tobytes().hex()
-
-            # 디버깅 로그 (접속자 확인용)
-            current_time = time.time()
-            if not hasattr(self, 'last_log_time'): self.last_log_time = 0
-            if current_time - self.last_log_time > 3.0:
-                #print(f"[Vision] 전송중.. 접속자: {len(self.websocket_clients)}명")
-                self.last_log_time = current_time
 
             self.broadcast({
                 'type': 'camera_image',
@@ -232,7 +252,8 @@ class SimpleRobotController(Node):
             })
 
         except Exception as e:
-            print(f"[Camera Error] {e}")
+            # print(f"[Camera Error] {e}")
+            pass
 
     def handle_qr_command(self, data):
         cmd = data.strip().upper()
@@ -266,7 +287,8 @@ class SimpleRobotController(Node):
         state = self.robot_states[self.current_robot]
         if state['emergency']: return
 
-        # 장애물 감지 시 전진 차단
+        # [수정] 박스 필터링된 거리값 사용
+        # 전진하려고 할 때(linear > 0), 경로상에 장애물이 있으면(0.3m 이내) 정지
         if linear > 0 and state['front_distance'] < 0.3:
             linear = 0.0
 
@@ -309,13 +331,11 @@ async def startup():
     print(f"SERVER START - Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
     print("=" * 60)
 
-    # [핵심 수정] 현재 실행 중인 이벤트 루프 가져오기
     loop = asyncio.get_running_loop()
 
     def ros_spin():
         rclpy.init()
         global ros_node
-        # Loop를 ROS 노드에 전달
         ros_node = SimpleRobotController(loop)
         rclpy.spin(ros_node)
 
@@ -338,7 +358,6 @@ async def websocket_endpoint(websocket: WebSocket):
     if ros_node:
         ros_node.websocket_clients.append(websocket)
         print(f"[WS] Connected. Total clients: {len(ros_node.websocket_clients)}")
-
         await websocket.send_text(json.dumps({'type': 'init', 'robots': list(ROBOTS.keys())}))
 
     try:
