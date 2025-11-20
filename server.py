@@ -13,7 +13,10 @@ import numpy as np
 from typing import Dict, Optional
 import os
 
-# ROS2 Domain 설정
+# ==========================================
+# ROS Domain ID 설정
+# ==========================================
+# 개별 테스트 시에는 '3'으로, 전체 통합 시에는 '5'로 설정하세요.
 os.environ['ROS_DOMAIN_ID'] = '5'
 
 import rclpy
@@ -202,6 +205,17 @@ class SimpleRobotController(Node):
             'ranges': list(msg.ranges[::10])  # 10개마다 1개씩만
         })
 
+    def battery_callback(self, msg):
+        """배터리 상태 (누락 수정됨)"""
+        state = self.robot_states[self.current_robot]
+        state['battery'] = msg.voltage
+
+        self.broadcast({
+            'type': 'battery',
+            'robot_id': self.current_robot,
+            'voltage': msg.voltage
+        })
+
     # ========== [팀원E 담당 시작] ==========
     def camera_callback(self, msg):
         """카메라 & QR 처리"""
@@ -242,11 +256,11 @@ class SimpleRobotController(Node):
                     })
 
                 else:
-                    # [안전 기능 추가] QR이 시야에서 사라지면 정보 초기화
+                    # [안전 기능] QR이 시야에서 사라지면 정보 초기화
                     self.last_qr_center = None
                     self.last_qr_width = 0
 
-                    # 정렬 중 QR을 놓치면 즉시 정지 (폭주 방지)
+                    # 정렬 중 QR을 놓치면 즉시 정지
                     if self.mark_aligning:
                         print("[QR] MARK 놓침 - 정지 및 정렬 해제")
                         self.stop()
@@ -388,7 +402,7 @@ async def startup():
 
     print("=" * 60)
     print("Simple Turtlebot Server")
-    print(f"Domain ID: 5")
+    print(f"Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
     print(f"Server: http://{SERVER_IP}:{SERVER_PORT}")
     print("=" * 60)
 
