@@ -17,10 +17,11 @@ import os
 # ROS Domain ID 설정
 # ==========================================
 # 개별 테스트 시에는 '3'으로, 전체 통합 시에는 '5'로 설정하세요.
-os.environ['ROS_DOMAIN_ID'] = '5'
+os.environ['ROS_DOMAIN_ID'] = '17'
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy  # [수정] QoS 모듈 추가
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage, BatteryState
@@ -87,16 +88,25 @@ class SimpleRobotController(Node):
         # Navigation Action Client
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
+        # [수정] 카메라용 QoS 프로필 설정 (Best Effort)
+        sensor_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT
+        )
+
         # Subscribers
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, 10)
 
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, 10)
+            LaserScan, '/scan', self.scan_callback,
+            sensor_qos) # 라이다도 보통 Best Effort 사용 (호환성 강화)
 
         self.camera_sub = self.create_subscription(
-            CompressedImage, '/camera/image_raw/compressed',
-            self.camera_callback, 10)
+            CompressedImage,
+            '/camera/image_raw/compressed',
+            self.camera_callback,
+            sensor_qos) # [수정] QoS 적용하여 구독
 
         self.battery_sub = self.create_subscription(
             BatteryState, '/battery_state', self.battery_callback, 10)
@@ -206,7 +216,7 @@ class SimpleRobotController(Node):
         })
 
     def battery_callback(self, msg):
-        """배터리 상태 (누락 수정됨)"""
+        """배터리 상태"""
         state = self.robot_states[self.current_robot]
         state['battery'] = msg.voltage
 
@@ -327,14 +337,17 @@ class SimpleRobotController(Node):
 
     def move(self, linear, angular):
         """로봇 이동"""
+        print(f"[디버깅] move 함수 호출됨: 선속도={linear}, 각속도={angular}")  # <--- 추가
         state = self.robot_states[self.current_robot]
 
         # 비상정지 체크
         if state['emergency']:
+            print("[디버깅] 비상정지 상태라 이동 불가") # <--- 추가
             return
 
         # 충돌 방지 체크
         if linear > 0 and state['front_distance'] < 0.3:
+            print(f"[디버깅] 장애물 감지됨 ({state['front_distance']}m) - 정지") # <--- 추가
             linear = 0.0
 
         msg = Twist()
@@ -342,6 +355,7 @@ class SimpleRobotController(Node):
         msg.angular.z = float(angular)
 
         self.cmd_pub.publish(msg)
+        print("[디버깅] ROS2 토픽 발행 완료") # <--- 추가
 
     def stop(self):
         """정지"""
