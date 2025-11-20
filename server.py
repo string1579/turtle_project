@@ -2,6 +2,7 @@
 """
 Simple Turtlebot Server - 발표용 완성본
 Domain 5 통일 + GUI 완벽 호환 + 필수 기능 포함
+수정자: 팀원 D (제어 담당) - 주행 로직 고도화 적용
 """
 
 import asyncio
@@ -121,12 +122,13 @@ class SimpleRobotController(Node):
 
         self.get_logger().info("Simple Controller Ready!")
 
+    # ========== [팀원D 제어 담당 시작] ==========
     def control_loop(self):
         """Mark 정밀 제어 루프"""
         if not self.mark_aligning or self.last_qr_center is None:
             return
 
-        # PID 제어
+        # PID 제어 (기존 유지, 필요 시 튜닝)
         image_center_x = 160  # 320x240 이미지 기준
         cx, cy = self.last_qr_center
 
@@ -152,11 +154,9 @@ class SimpleRobotController(Node):
         angular = -error_x * 0.003  # 좌우 회전
         linear = error_size * 0.001  # 전후 이동
 
-        # 속도 제한
-        angular = max(-0.3, min(0.3, angular))
-        linear = max(-0.05, min(0.05, linear))
-
+        # move 함수 내부에 제한 로직이 추가되었으므로 여기서는 계산된 값 전달
         self.move(linear, angular)
+    # ========== [팀원D 제어 담당 끝] ==========
 
     def odom_callback(self, msg):
         """위치 정보 업데이트"""
@@ -181,24 +181,38 @@ class SimpleRobotController(Node):
             }
         })
 
+    # ========== [팀원D 제어 담당 시작] ==========
     def scan_callback(self, msg):
-        """LiDAR 충돌 방지"""
+        """LiDAR 충돌 방지 (개선된 로직 적용)"""
         if not msg.ranges:
             return
 
         state = self.robot_states[self.current_robot]
 
-        # 전방 30도 체크
-        front_ranges = list(msg.ranges[0:30]) + list(msg.ranges[-30:])
-        valid = [r for r in front_ranges if 0.1 < r < 10.0]
+        # [개선] FullAutonomyNode의 데이터 필터링 로직 적용
+        # 전방 60도 (좌우 30도) 데이터 추출
+        num_readings = len(msg.ranges)
 
-        if valid:
-            min_dist = min(valid)
+        # 배열 인덱스 안전 처리
+        right_slice = msg.ranges[0:min(30, num_readings)]
+        left_slice = msg.ranges[max(0, num_readings - 30):num_readings]
+        front_ranges = list(right_slice) + list(left_slice)
+
+        # 유효성 검사: NaN, Inf 제외 및 0.1m ~ 10.0m 사이 값만 사용
+        valid_ranges = [r for r in front_ranges if not math.isnan(r) and not math.isinf(r) and 0.1 < r < 10.0]
+
+        if valid_ranges:
+            min_dist = min(valid_ranges)
             state['front_distance'] = min_dist
 
             # 충돌 방지 (lidar_enabled일 때만)
-            if state['lidar_enabled'] and min_dist < 0.35:
+            # [설정] 정지 거리를 0.35m로 설정 (안전 마진)
+            STOP_DISTANCE = 0.35
+
+            if state['lidar_enabled'] and min_dist < STOP_DISTANCE:
                 if state['mode'] != 'emergency':
+                    # 후진은 허용하고 싶다면 move 함수에서 linear < 0 체크 필요
+                    # 여기서는 일단 강제 정지
                     self.stop()
                     print(f"[충돌 방지] 정지! 거리: {min_dist:.2f}m")
 
@@ -207,13 +221,17 @@ class SimpleRobotController(Node):
                         'robot_id': self.current_robot,
                         'message': f'장애물 감지: {min_dist:.2f}m'
                     })
+        else:
+             # 유효한 데이터가 없으면 안전을 위해 적당히 큰 값 설정
+             state['front_distance'] = 999.0
 
-        # GUI용 scan 데이터 (간소화)
+        # GUI용 scan 데이터 (데이터량 줄여서 전송)
         self.broadcast({
             'type': 'scan',
             'robot_id': self.current_robot,
             'ranges': list(msg.ranges[::10])  # 10개마다 1개씩만
         })
+    # ========== [팀원D 제어 담당 끝] ==========
 
     def battery_callback(self, msg):
         """배터리 상태"""
@@ -318,26 +336,33 @@ class SimpleRobotController(Node):
                 pass
     # ========== [팀원E 담당 끝] ==========
 
+    # ========== [팀원D 제어 담당 시작] ==========
     def navigate_to(self, x, y, yaw=0.0):
-        """Navigation2 목표 이동"""
+        """Navigation2 목표 이동 (로직 보강)"""
         if not self.nav_client.wait_for_server(timeout_sec=1.0):
             print("[Nav] Nav2 서버 응답 없음")
             return
 
+        # Yaw (Radian) -> Quaternion 변환
+        # FullAutonomyNode의 계산 로직 적용
+        q_z = math.sin(yaw / 2.0)
+        q_w = math.cos(yaw / 2.0)
+
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
         goal.pose.header.stamp = self.get_clock().now().to_msg()
-        goal.pose.pose.position.x = x
-        goal.pose.pose.position.y = y
-        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
-        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.z = q_z
+        goal.pose.pose.orientation.w = q_w
 
         self.nav_client.send_goal_async(goal)
         print(f"[Nav] 목표 전송: ({x:.1f}, {y:.1f})")
+    # ========== [팀원D 제어 담당 끝] ==========
 
+    # ========== [팀원D 제어 담당 시작] ==========
     def move(self, linear, angular):
         """로봇 이동"""
-        print(f"[디버깅] move 함수 호출됨: 선속도={linear}, 각속도={angular}")  # <--- 추가
         state = self.robot_states[self.current_robot]
 
         # 비상정지 체크
@@ -345,22 +370,35 @@ class SimpleRobotController(Node):
             print("[디버깅] 비상정지 상태라 이동 불가") # <--- 추가
             return
 
-        # 충돌 방지 체크
+        # 안전 상수 설정 (FullAutonomyNode 참조)
+        MAX_LINEAR = 0.22   # 터틀봇3 최대 속도 (안전을 위해 약간 낮춤)
+        MAX_ANGULAR = 2.0   # 터틀봇3 최대 회전 속도
+
+        # 속도 제한 (Clamping)
+        linear = max(-MAX_LINEAR, min(MAX_LINEAR, float(linear)))
+        angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, float(angular)))
+
+        # 충돌 방지 체크 (후진은 허용)
+        # 전방 장애물 있고, 앞으로 가려고 할 때만 막음
         if linear > 0 and state['front_distance'] < 0.3:
             print(f"[디버깅] 장애물 감지됨 ({state['front_distance']}m) - 정지") # <--- 추가
             linear = 0.0
+            # print("[안전] 전방 장애물로 전진 차단")
 
         msg = Twist()
-        msg.linear.x = float(linear)
-        msg.angular.z = float(angular)
+        msg.linear.x = linear
+        msg.angular.z = angular
 
         self.cmd_pub.publish(msg)
         print("[디버깅] ROS2 토픽 발행 완료") # <--- 추가
+    # ========== [팀원D 제어 담당 끝] ==========
 
+    # ========== [팀원D 제어 담당 시작] ==========
     def stop(self):
         """정지"""
         self.move(0.0, 0.0)
         self.mark_aligning = False
+    # ========== [팀원D 제어 담당 끝] ==========
 
     def set_emergency(self, robot_id, emergency):
         """비상정지 설정"""
@@ -510,7 +548,7 @@ async def handle_command(msg: dict):
 
     elif cmd == 'qr_stop':
         ros_node.robot_states[robot_id]['qr_enabled'] = False
-        ros_node.mark_aligning = False
+        ros_node.mark_aligning = Falsehg
         print("[QR] 비활성화")
 
     elif cmd == 'lidar_check':
