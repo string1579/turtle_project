@@ -24,7 +24,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont
 import websocket
 
 # 서버 설정
-SERVER_IP = "192.168.30.5"
+SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8080
 
 ROBOTS = {
