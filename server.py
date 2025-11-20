@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Simple Turtlebot Server - 발표용 완성본
-Domain 5 통일 + GUI 완벽 호환 + 필수 기능 포함
-수정자: 팀원 D (제어 담당) - 주행 로직 고도화 적용
+Simple Turtlebot Server - Final Stable Version
+수정: 팀원 A, B, D, E 통합 (스레드 안전성 확보)
 """
 
 import asyncio
@@ -11,18 +10,18 @@ import math
 import time
 import cv2
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import os
+from threading import Thread
 
 # ==========================================
 # ROS Domain ID 설정
 # ==========================================
-# 개별 테스트 시에는 '3'으로, 전체 통합 시에는 '5'로 설정하세요.
 os.environ['ROS_DOMAIN_ID'] = '5'
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy  # [수정] QoS 모듈 추가
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, CompressedImage, BatteryState
@@ -32,7 +31,6 @@ from rclpy.action import ActionClient
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from threading import Thread
 
 # ==========================================
 # 설정
@@ -47,15 +45,18 @@ SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8080
 
 # ==========================================
-# ROS2 노드 (GUI 호환 버전)
+# ROS2 노드 (통합 수정됨)
 # ==========================================
 class SimpleRobotController(Node):
-    def __init__(self):
+    def __init__(self, loop):
         super().__init__('simple_controller')
+
+        # [핵심 수정] 메인 이벤트 루프 저장 (스레드 간 통신용)
+        self.app_loop = loop
 
         print(f"[ROS] Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
 
-        # 로봇 상태 (GUI 형식에 맞춤)
+        # 로봇 상태
         self.robot_states = {}
         for rid in ROBOTS.keys():
             self.robot_states[rid] = {
@@ -63,345 +64,222 @@ class SimpleRobotController(Node):
                 'battery': 0.0,
                 'front_distance': float('inf'),
                 'emergency': False,
-                'mode': 'idle',  # idle, manual, mark_aligning
+                'mode': 'idle',
                 'qr_enabled': False,
                 'lidar_enabled': False
             }
 
-        # 현재 제어 중인 로봇
         self.current_robot = 1
+        self.websocket_clients: List[WebSocket] = []
 
-        # WebSocket 클라이언트들
-        self.websocket_clients = []
-
-        # QR 관련
+        # 비전 관련
         self.qr_detector = cv2.QRCodeDetector()
-
-        # Mark 정밀 제어 관련 (Team E 담당 변수)
         self.mark_aligning = False
         self.last_qr_center = None
         self.last_qr_width = 0
-        self.target_qr_width = 150  # 목표 크기
+        self.target_qr_width = 150
 
-        # Publisher
+        # ROS 통신 객체들
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        # Navigation Action Client
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.init_pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
-        # [수정] 카메라용 QoS 프로필 설정 (Best Effort)
-        sensor_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT
-        )
+        # QoS 설정
+        sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         # Subscribers
-        self.odom_sub = self.create_subscription(
-            Odometry, '/odom', self.odom_callback, 10)
-
-        self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback,
-            sensor_qos) # 라이다도 보통 Best Effort 사용 (호환성 강화)
-
-        self.camera_sub = self.create_subscription(
-            CompressedImage,
-            '/camera/image_raw/compressed',
-            self.camera_callback,
-            sensor_qos) # [수정] QoS 적용하여 구독
-
-        self.battery_sub = self.create_subscription(
-            BatteryState, '/battery_state', self.battery_callback, 10)
-
-        # 초기 위치 퍼블리셔
-        self.init_pose_pub = self.create_publisher(
-            PoseWithCovarianceStamped, '/initialpose', 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, sensor_qos)
+        self.camera_sub = self.create_subscription(CompressedImage, '/camera/image_raw/compressed', self.camera_callback, sensor_qos)
+        self.battery_sub = self.create_subscription(BatteryState, '/battery_state', self.battery_callback, 10)
 
         # 타이머
-        self.create_timer(0.1, self.control_loop)  # 10Hz 제어 루프
-        self.create_timer(3.0, self.publish_initial_pose)  # 초기 위치
+        self.create_timer(0.1, self.control_loop)
+        self.create_timer(3.0, self.publish_initial_pose)
 
         self.get_logger().info("Simple Controller Ready!")
 
-    # ========== [팀원D 제어 담당 시작] ==========
+    # [팀원 A, B 핵심 수정] 스레드 안전한 브로드캐스트
+    def broadcast(self, message):
+        """ROS 스레드에서 FastAPI 루프로 안전하게 메시지 전송"""
+        if not self.websocket_clients:
+            return
+
+        json_msg = json.dumps(message)
+
+        # 죽은 클라이언트 정리를 위한 리스트
+        dead_clients = []
+
+        for client in self.websocket_clients:
+            try:
+                # [핵심] run_coroutine_threadsafe 사용
+                # ROS 스레드에서 메인 루프(app_loop)에 작업을 예약함
+                asyncio.run_coroutine_threadsafe(client.send_text(json_msg), self.app_loop)
+            except Exception as e:
+                print(f"[Broadcast Error] {e}")
+                dead_clients.append(client)
+
+        # 연결 끊긴 클라이언트 정리
+        for dc in dead_clients:
+            if dc in self.websocket_clients:
+                self.websocket_clients.remove(dc)
+
     def control_loop(self):
-        """Mark 정밀 제어 루프"""
+        """Mark 정밀 제어"""
         if not self.mark_aligning or self.last_qr_center is None:
             return
 
-        # PID 제어 (기존 유지, 필요 시 튜닝)
-        image_center_x = 160  # 320x240 이미지 기준
+        image_center_x = 160
         cx, cy = self.last_qr_center
+        error_x = cx - image_center_x
+        error_size = self.target_qr_width - self.last_qr_width
 
-        # 에러 계산
-        error_x = cx - image_center_x  # 좌우 오차
-        error_size = self.target_qr_width - self.last_qr_width  # 거리 오차
-
-        # 허용 오차
         if abs(error_x) < 20 and abs(error_size) < 20:
-            # 정렬 완료
             self.stop()
             self.mark_aligning = False
             print("[MARK] 정밀 정렬 완료!")
-
-            self.broadcast({
-                'type': 'qr_detected',
-                'robot_id': self.current_robot,
-                'qr_text': 'MARK - 정렬 완료'
-            })
+            self.broadcast({'type': 'qr_detected', 'robot_id': self.current_robot, 'qr_text': 'MARK - 정렬 완료'})
             return
 
-        # 제어 명령
-        angular = -error_x * 0.003  # 좌우 회전
-        linear = error_size * 0.001  # 전후 이동
-
-        # move 함수 내부에 제한 로직이 추가되었으므로 여기서는 계산된 값 전달
+        angular = -error_x * 0.003
+        linear = error_size * 0.001
         self.move(linear, angular)
-    # ========== [팀원D 제어 담당 끝] ==========
 
     def odom_callback(self, msg):
-        """위치 정보 업데이트"""
         state = self.robot_states[self.current_robot]
         state['x'] = msg.pose.pose.position.x
         state['y'] = msg.pose.pose.position.y
 
-        # Yaw 계산
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         state['yaw'] = math.atan2(2.0 * qz * qw, 1.0 - 2.0 * qz * qz)
 
-        # GUI 형식에 맞춘 broadcast
         self.broadcast({
             'type': 'position',
             'robot_id': self.current_robot,
-            'position': {
-                'x': state['x'],
-                'y': state['y'],
-                'qz': qz,
-                'qw': qw
-            }
+            'position': {'x': state['x'], 'y': state['y']}
         })
 
-    # ========== [팀원D 제어 담당 시작] ==========
     def scan_callback(self, msg):
-        """LiDAR 충돌 방지 (개선된 로직 적용)"""
-        if not msg.ranges:
-            return
+        if not msg.ranges: return
 
         state = self.robot_states[self.current_robot]
-
-        # [개선] FullAutonomyNode의 데이터 필터링 로직 적용
-        # 전방 60도 (좌우 30도) 데이터 추출
+        # 전방 데이터 필터링
         num_readings = len(msg.ranges)
+        right = msg.ranges[0:min(30, num_readings)]
+        left = msg.ranges[max(0, num_readings - 30):num_readings]
+        front = list(right) + list(left)
+        valid = [r for r in front if not math.isnan(r) and not math.isinf(r) and 0.1 < r < 10.0]
 
-        # 배열 인덱스 안전 처리
-        right_slice = msg.ranges[0:min(30, num_readings)]
-        left_slice = msg.ranges[max(0, num_readings - 30):num_readings]
-        front_ranges = list(right_slice) + list(left_slice)
-
-        # 유효성 검사: NaN, Inf 제외 및 0.1m ~ 10.0m 사이 값만 사용
-        valid_ranges = [r for r in front_ranges if not math.isnan(r) and not math.isinf(r) and 0.1 < r < 10.0]
-
-        if valid_ranges:
-            min_dist = min(valid_ranges)
+        if valid:
+            min_dist = min(valid)
             state['front_distance'] = min_dist
 
-            # 충돌 방지 (lidar_enabled일 때만)
-            # [설정] 정지 거리를 0.35m로 설정 (안전 마진)
-            STOP_DISTANCE = 0.35
-
-            if state['lidar_enabled'] and min_dist < STOP_DISTANCE:
-                if state['mode'] != 'emergency':
-                    # 후진은 허용하고 싶다면 move 함수에서 linear < 0 체크 필요
-                    # 여기서는 일단 강제 정지
-                    self.stop()
-                    print(f"[충돌 방지] 정지! 거리: {min_dist:.2f}m")
-
-                    self.broadcast({
-                        'type': 'collision_warning',
-                        'robot_id': self.current_robot,
-                        'message': f'장애물 감지: {min_dist:.2f}m'
-                    })
+            if state['lidar_enabled'] and min_dist < 0.35 and state['mode'] != 'emergency':
+                self.stop()
+                self.broadcast({'type': 'collision_warning', 'robot_id': self.current_robot, 'message': f'장애물: {min_dist:.2f}m'})
         else:
-             # 유효한 데이터가 없으면 안전을 위해 적당히 큰 값 설정
-             state['front_distance'] = 999.0
+            state['front_distance'] = 999.0
 
-        # GUI용 scan 데이터 (데이터량 줄여서 전송)
         self.broadcast({
             'type': 'scan',
             'robot_id': self.current_robot,
-            'ranges': list(msg.ranges[::10])  # 10개마다 1개씩만
-        })
-    # ========== [팀원D 제어 담당 끝] ==========
-
-    def battery_callback(self, msg):
-        """배터리 상태"""
-        state = self.robot_states[self.current_robot]
-        state['battery'] = msg.voltage
-
-        self.broadcast({
-            'type': 'battery',
-            'robot_id': self.current_robot,
-            'voltage': msg.voltage
+            'ranges': list(msg.ranges[::10])
         })
 
-    # ========== [팀원E 담당 시작] ==========
     def camera_callback(self, msg):
-        """카메라 & QR 처리"""
+        """카메라 처리 (정석 방법 적용)"""
         try:
-            # 이미지 디코드
             np_arr = np.frombuffer(msg.data, np.uint8)
             cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if cv_image is None: return
 
-            if cv_image is None:
-                return
-
-            # QR 처리 (qr_enabled일 때만)
+            # QR 처리
             state = self.robot_states[self.current_robot]
             if state['qr_enabled']:
                 gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
                 data, points, _ = self.qr_detector.detectAndDecode(gray)
 
                 if data:
-                    print(f"[QR] 감지: '{data}'")
-
-                    # QR 중심점 계산 (MARK용)
                     if points is not None:
                         points = points.reshape(-1, 2)
-                        cx = np.mean(points[:, 0])
-                        cy = np.mean(points[:, 1])
-                        width = np.linalg.norm(points[0] - points[1])
+                        self.last_qr_center = (np.mean(points[:, 0]), np.mean(points[:, 1]))
+                        self.last_qr_width = np.linalg.norm(points[0] - points[1])
 
-                        self.last_qr_center = (cx, cy)
-                        self.last_qr_width = width
-
-                    # QR 명령 처리
                     self.handle_qr_command(data)
-
-                    self.broadcast({
-                        'type': 'qr_detected',
-                        'robot_id': self.current_robot,
-                        'qr_text': data
-                    })
-
+                    self.broadcast({'type': 'qr_detected', 'robot_id': self.current_robot, 'qr_text': data})
                 else:
-                    # [안전 기능] QR이 시야에서 사라지면 정보 초기화
                     self.last_qr_center = None
-                    self.last_qr_width = 0
-
-                    # 정렬 중 QR을 놓치면 즉시 정지
                     if self.mark_aligning:
-                        print("[QR] MARK 놓침 - 정지 및 정렬 해제")
                         self.stop()
                         self.mark_aligning = False
 
-            # 이미지 전송 (GUI 표시용)
-            _, buffer = cv2.imencode('.jpg', cv_image,
-                                    [cv2.IMWRITE_JPEG_QUALITY, 50])
+            # 이미지 전송 (broadcast 사용 - 이제 안전함!)
+            _, buffer = cv2.imencode('.jpg', cv_image, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            image_hex = buffer.tobytes().hex()
+
+            # 디버깅 로그 (접속자 확인용)
+            current_time = time.time()
+            if not hasattr(self, 'last_log_time'): self.last_log_time = 0
+            if current_time - self.last_log_time > 3.0:
+                #print(f"[Vision] 전송중.. 접속자: {len(self.websocket_clients)}명")
+                self.last_log_time = current_time
 
             self.broadcast({
                 'type': 'camera_image',
                 'robot_id': self.current_robot,
-                'image_data': buffer.tobytes().hex()
+                'image_data': image_hex
             })
 
         except Exception as e:
-            self.get_logger().error(f"Camera error: {e}")
+            print(f"[Camera Error] {e}")
 
     def handle_qr_command(self, data):
-        """QR 명령 처리"""
         cmd = data.strip().upper()
-
-        if cmd == "STOP":
-            self.stop()
-            print("[QR] 정지")
-
+        if cmd == "STOP": self.stop()
         elif cmd == "MARK":
-            # 정밀 정렬 모드
             self.mark_aligning = True
             self.robot_states[self.current_robot]['mode'] = 'mark_aligning'
-            print("[QR] MARK 정밀 정렬 시작")
-
         elif cmd.startswith("NAV_GOAL:"):
-            # 좌표 이동 (예: NAV_GOAL:2.0,1.0,0.0)
             try:
                 parts = cmd.split(':')[1].split(',')
                 if len(parts) >= 2:
-                    x = float(parts[0])
-                    y = float(parts[1])
-                    yaw = float(parts[2]) if len(parts) > 2 else 0.0
+                    self.navigate_to(float(parts[0]), float(parts[1]))
+            except: pass
 
-                    self.navigate_to(x, y, yaw)
-                    print(f"[QR] 목표 이동: ({x}, {y})")
-            except:
-                pass
-    # ========== [팀원E 담당 끝] ==========
+    def battery_callback(self, msg):
+        self.robot_states[self.current_robot]['battery'] = msg.voltage
+        self.broadcast({'type': 'battery', 'robot_id': self.current_robot, 'voltage': msg.voltage})
 
-    # ========== [팀원D 제어 담당 시작] ==========
     def navigate_to(self, x, y, yaw=0.0):
-        """Navigation2 목표 이동 (로직 보강)"""
-        if not self.nav_client.wait_for_server(timeout_sec=1.0):
-            print("[Nav] Nav2 서버 응답 없음")
-            return
-
-        # Yaw (Radian) -> Quaternion 변환
-        # FullAutonomyNode의 계산 로직 적용
-        q_z = math.sin(yaw / 2.0)
-        q_w = math.cos(yaw / 2.0)
-
+        if not self.nav_client.wait_for_server(timeout_sec=1.0): return
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = float(x)
         goal.pose.pose.position.y = float(y)
-        goal.pose.pose.orientation.z = q_z
-        goal.pose.pose.orientation.w = q_w
-
+        goal.pose.pose.orientation.z = math.sin(yaw/2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw/2.0)
         self.nav_client.send_goal_async(goal)
-        print(f"[Nav] 목표 전송: ({x:.1f}, {y:.1f})")
-    # ========== [팀원D 제어 담당 끝] ==========
 
-    # ========== [팀원D 제어 담당 시작] ==========
     def move(self, linear, angular):
-        """로봇 이동"""
         state = self.robot_states[self.current_robot]
+        if state['emergency']: return
 
-        # 비상정지 체크
-        if state['emergency']:
-            print("[디버깅] 비상정지 상태라 이동 불가") # <--- 추가
-            return
-
-        # 안전 상수 설정 (FullAutonomyNode 참조)
-        MAX_LINEAR = 0.22   # 터틀봇3 최대 속도 (안전을 위해 약간 낮춤)
-        MAX_ANGULAR = 2.0   # 터틀봇3 최대 회전 속도
-
-        # 속도 제한 (Clamping)
-        linear = max(-MAX_LINEAR, min(MAX_LINEAR, float(linear)))
-        angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, float(angular)))
-
-        # 충돌 방지 체크 (후진은 허용)
-        # 전방 장애물 있고, 앞으로 가려고 할 때만 막음
+        # 장애물 감지 시 전진 차단
         if linear > 0 and state['front_distance'] < 0.3:
-            print(f"[디버깅] 장애물 감지됨 ({state['front_distance']}m) - 정지") # <--- 추가
             linear = 0.0
-            # print("[안전] 전방 장애물로 전진 차단")
 
         msg = Twist()
-        msg.linear.x = linear
-        msg.angular.z = angular
-
+        msg.linear.x = max(-0.22, min(0.22, float(linear)))
+        msg.angular.z = max(-2.0, min(2.0, float(angular)))
         self.cmd_pub.publish(msg)
-        print("[디버깅] ROS2 토픽 발행 완료") # <--- 추가
-    # ========== [팀원D 제어 담당 끝] ==========
 
-    # ========== [팀원D 제어 담당 시작] ==========
     def stop(self):
-        """정지"""
         self.move(0.0, 0.0)
         self.mark_aligning = False
-    # ========== [팀원D 제어 담당 끝] ==========
 
     def set_emergency(self, robot_id, emergency):
-        """비상정지 설정"""
         self.robot_states[robot_id]['emergency'] = emergency
         if emergency:
             self.stop()
@@ -410,183 +288,98 @@ class SimpleRobotController(Node):
             self.robot_states[robot_id]['mode'] = 'idle'
 
     def publish_initial_pose(self):
-        """초기 위치 설정"""
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.pose.position.x = 0.0
-        msg.pose.pose.position.y = 0.0
         msg.pose.pose.orientation.w = 1.0
-
         self.init_pose_pub.publish(msg)
-        self.get_logger().info("Initial pose published")
-
-    def broadcast(self, message):
-        """WebSocket 브로드캐스트"""
-        if not self.websocket_clients:
-            return
-
-        json_msg = json.dumps(message)
-
-        for client in self.websocket_clients[:]:
-            try:
-                asyncio.create_task(client.send_text(json_msg))
-            except:
-                self.websocket_clients.remove(client)
 
 # ==========================================
 # FastAPI 서버
 # ==========================================
-app = FastAPI(title="Simple Turtlebot Server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 ros_node: Optional[SimpleRobotController] = None
 
 @app.on_event("startup")
 async def startup():
     global ros_node
-
     print("=" * 60)
-    print("Simple Turtlebot Server")
-    print(f"Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
-    print(f"Server: http://{SERVER_IP}:{SERVER_PORT}")
+    print(f"SERVER START - Domain ID: {os.environ.get('ROS_DOMAIN_ID')}")
     print("=" * 60)
 
-    # ROS2 스레드
+    # [핵심 수정] 현재 실행 중인 이벤트 루프 가져오기
+    loop = asyncio.get_running_loop()
+
     def ros_spin():
         rclpy.init()
         global ros_node
-        ros_node = SimpleRobotController()
+        # Loop를 ROS 노드에 전달
+        ros_node = SimpleRobotController(loop)
         rclpy.spin(ros_node)
 
     ros_thread = Thread(target=ros_spin, daemon=True)
     ros_thread.start()
 
-    # ROS 노드 대기
     while ros_node is None:
         await asyncio.sleep(0.1)
-
     print("[Server] Ready!")
 
 @app.on_event("shutdown")
 async def shutdown():
-    if ros_node:
-        ros_node.destroy_node()
+    if ros_node: ros_node.destroy_node()
     rclpy.shutdown()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print(f"[WS] Client connected: {websocket.client}")
 
-    # ros_node가 초기화될 때까지 잠시 대기하거나 안전장치 확인
     if ros_node:
         ros_node.websocket_clients.append(websocket)
-    else:
-        print("[WS] Warning: ROS Node not ready yet")
+        print(f"[WS] Connected. Total clients: {len(ros_node.websocket_clients)}")
 
-    # 초기 정보 전송
-    try:
-        await websocket.send_text(json.dumps({
-            'type': 'init',
-            'robots': list(ROBOTS.keys())
-        }))
-    except Exception as e:
-        print(f"[WS] Send error during init: {e}")
+        await websocket.send_text(json.dumps({'type': 'init', 'robots': list(ROBOTS.keys())}))
 
     try:
         while True:
             data = await websocket.receive_text()
-
-            try:
-                msg = json.loads(data)
-                await handle_command(msg)
-
-                # 처리 완료 응답 (선택 사항, 부하가 크다면 제거 가능)
-                # await websocket.send_text(json.dumps({'status': 'ok'}))
-
-            except json.JSONDecodeError:
-                print(f"[WS] Invalid JSON format received: {data[:50]}...")
-                continue
-            except Exception as e:
-                print(f"[WS] Error processing message: {e}")
-                continue
-
-    except WebSocketDisconnect:
-        print(f"[WS] Client disconnected: {websocket.client}")
-    except Exception as e:
-        print(f"[WS] Unexpected connection error: {e}")
-    finally:
-        # 연결 종료 시 리스트에서 안전하게 제거
+            msg = json.loads(data)
+            await handle_command(msg)
+    except:
         if ros_node and websocket in ros_node.websocket_clients:
             ros_node.websocket_clients.remove(websocket)
-            print(f"[WS] Client removed from broadcast list")
+            print("[WS] Disconnected")
 
 async def handle_command(msg: dict):
-    """GUI 명령 처리"""
-    if not ros_node:
-        print("[Server] Error: ROS Node is not running")
-        return
+    if not ros_node: return
 
     cmd = msg.get('command')
-    robot_id = msg.get('robot_id', 1)
-
-    # 로봇 전환 (명령이 들어온 로봇을 현재 제어 대상으로 설정)
-    ros_node.current_robot = robot_id
+    rid = msg.get('robot_id', 1)
+    ros_node.current_robot = rid
 
     if cmd == 'move':
-        linear = msg.get('linear', 0)
-        angular = msg.get('angular', 0)
-        ros_node.move(linear, angular)
-        ros_node.robot_states[robot_id]['mode'] = 'manual'
-
+        ros_node.move(msg.get('linear', 0), msg.get('angular', 0))
+        ros_node.robot_states[rid]['mode'] = 'manual'
     elif cmd == 'stop':
         ros_node.stop()
-        ros_node.robot_states[robot_id]['mode'] = 'idle'
-
+        ros_node.robot_states[rid]['mode'] = 'idle'
     elif cmd == 'emergency_stop':
-        ros_node.set_emergency(robot_id, True)
-        print(f"[Command] Emergency Stop: Robot {robot_id}")
-
+        ros_node.set_emergency(rid, True)
     elif cmd == 'release_emergency':
-        ros_node.set_emergency(robot_id, False)
-        print(f"[Command] Release Emergency: Robot {robot_id}")
-
+        ros_node.set_emergency(rid, False)
     elif cmd == 'navigate_to':
-        x = msg.get('x', 0)
-        y = msg.get('y', 0)
-        yaw = msg.get('yaw', 0)
-        ros_node.navigate_to(x, y, yaw)
-
+        ros_node.navigate_to(msg.get('x', 0), msg.get('y', 0), msg.get('yaw', 0))
     elif cmd == 'qr_detect':
-        ros_node.robot_states[robot_id]['qr_enabled'] = True
-        print(f"[QR] Enabled for Robot {robot_id}")
-
+        ros_node.robot_states[rid]['qr_enabled'] = True
     elif cmd == 'qr_stop':
-        ros_node.robot_states[robot_id]['qr_enabled'] = False
-        ros_node.mark_aligning = False
-        print(f"[QR] Disabled for Robot {robot_id}")
-
+        ros_node.robot_states[rid]['qr_enabled'] = False
     elif cmd == 'lidar_check':
-        ros_node.robot_states[robot_id]['lidar_enabled'] = True
-        print(f"[LiDAR] Enabled for Robot {robot_id}")
-
+        ros_node.robot_states[rid]['lidar_enabled'] = True
     elif cmd == 'lidar_stop':
-        ros_node.robot_states[robot_id]['lidar_enabled'] = False
-        print(f"[LiDAR] Disabled for Robot {robot_id}")
-
+        ros_node.robot_states[rid]['lidar_enabled'] = False
     elif cmd == 'camera_start':
-        # 이미 자동 스트리밍 중이므로 로그만 남김
         pass
 
-    else:
-        print(f"[WS] Unknown command received: {cmd}")
-
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_IP, port=SERVER_PORT, log_level="warning")
+    uvicorn.run(app, host=SERVER_IP, port=SERVER_PORT)
