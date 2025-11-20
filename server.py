@@ -43,7 +43,7 @@ ROBOTS = {
     3: {"name": "터틀봇3", "ip": "192.168.30.9"}
 }
 
-SERVER_IP = "0.0.0.0"
+SERVER_IP = "127.0.0.1"
 SERVER_PORT = 8080
 
 # ==========================================
@@ -483,41 +483,61 @@ async def shutdown():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print(f"[WS] Client connected")
+    print(f"[WS] Client connected: {websocket.client}")
 
+    # ros_node가 초기화될 때까지 잠시 대기하거나 안전장치 확인
     if ros_node:
         ros_node.websocket_clients.append(websocket)
+    else:
+        print("[WS] Warning: ROS Node not ready yet")
 
     # 초기 정보 전송
-    await websocket.send_text(json.dumps({
-        'type': 'init',
-        'robots': list(ROBOTS.keys())
-    }))
+    try:
+        await websocket.send_text(json.dumps({
+            'type': 'init',
+            'robots': list(ROBOTS.keys())
+        }))
+    except Exception as e:
+        print(f"[WS] Send error during init: {e}")
 
     try:
         while True:
             data = await websocket.receive_text()
-            msg = json.loads(data)
 
-            await handle_command(msg)
+            try:
+                msg = json.loads(data)
+                await handle_command(msg)
 
-            # 응답
-            await websocket.send_text(json.dumps({'status': 'ok'}))
+                # 처리 완료 응답 (선택 사항, 부하가 크다면 제거 가능)
+                # await websocket.send_text(json.dumps({'status': 'ok'}))
+
+            except json.JSONDecodeError:
+                print(f"[WS] Invalid JSON format received: {data[:50]}...")
+                continue
+            except Exception as e:
+                print(f"[WS] Error processing message: {e}")
+                continue
 
     except WebSocketDisconnect:
-        print("[WS] Client disconnected")
+        print(f"[WS] Client disconnected: {websocket.client}")
+    except Exception as e:
+        print(f"[WS] Unexpected connection error: {e}")
+    finally:
+        # 연결 종료 시 리스트에서 안전하게 제거
         if ros_node and websocket in ros_node.websocket_clients:
             ros_node.websocket_clients.remove(websocket)
+            print(f"[WS] Client removed from broadcast list")
 
 async def handle_command(msg: dict):
     """GUI 명령 처리"""
     if not ros_node:
+        print("[Server] Error: ROS Node is not running")
         return
 
     cmd = msg.get('command')
     robot_id = msg.get('robot_id', 1)
 
-    # 로봇 전환
+    # 로봇 전환 (명령이 들어온 로봇을 현재 제어 대상으로 설정)
     ros_node.current_robot = robot_id
 
     if cmd == 'move':
@@ -532,9 +552,11 @@ async def handle_command(msg: dict):
 
     elif cmd == 'emergency_stop':
         ros_node.set_emergency(robot_id, True)
+        print(f"[Command] Emergency Stop: Robot {robot_id}")
 
     elif cmd == 'release_emergency':
         ros_node.set_emergency(robot_id, False)
+        print(f"[Command] Release Emergency: Robot {robot_id}")
 
     elif cmd == 'navigate_to':
         x = msg.get('x', 0)
@@ -544,23 +566,27 @@ async def handle_command(msg: dict):
 
     elif cmd == 'qr_detect':
         ros_node.robot_states[robot_id]['qr_enabled'] = True
-        print("[QR] 활성화")
+        print(f"[QR] Enabled for Robot {robot_id}")
 
     elif cmd == 'qr_stop':
         ros_node.robot_states[robot_id]['qr_enabled'] = False
-        ros_node.mark_aligning = Falsehg
-        print("[QR] 비활성화")
+        ros_node.mark_aligning = False
+        print(f"[QR] Disabled for Robot {robot_id}")
 
     elif cmd == 'lidar_check':
         ros_node.robot_states[robot_id]['lidar_enabled'] = True
-        print("[LiDAR] 충돌 방지 활성화")
+        print(f"[LiDAR] Enabled for Robot {robot_id}")
 
     elif cmd == 'lidar_stop':
         ros_node.robot_states[robot_id]['lidar_enabled'] = False
-        print("[LiDAR] 충돌 방지 비활성화")
+        print(f"[LiDAR] Disabled for Robot {robot_id}")
 
     elif cmd == 'camera_start':
-        pass  # 이미 자동 스트리밍
+        # 이미 자동 스트리밍 중이므로 로그만 남김
+        pass
+
+    else:
+        print(f"[WS] Unknown command received: {cmd}")
 
 if __name__ == "__main__":
     uvicorn.run(app, host=SERVER_IP, port=SERVER_PORT, log_level="warning")
